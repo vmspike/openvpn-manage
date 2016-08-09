@@ -1,0 +1,33 @@
+### Example configuration file for openvpn-manage
+# Bash syntax required
+# Easyrsa vars must be properly setup before!
+###
+
+CA_PASS=no  # 'yes' if CA is password protected
+
+### Usually you don't need to change these options
+SERVER_PATH='/etc/openvpn/server'
+KEYS_PATH="${SERVER_PATH}/keys"
+CLIENT_KEYS="${SERVER_PATH}/client-keys"
+CLIENT_PACKS="${SERVER_PATH}/client-packs"
+CLIENT_CONFIGS="${SERVER_PATH}/client-configs"
+CLIENT_CONFIG_USERS="${SERVER_PATH}/users-config"
+SERVER_CONF='/etc/openvpn/server.conf'
+EASYRSA='/etc/openvpn/easy-rsa/easyrsa3'
+
+### Client config options
+COMPANY='Example Corp'
+CLIENT_CONFIG_EXT=ovpn  # useful values is 'conf' for Unix-based OS or 'ovpn' for Windows
+OVPN_REMOTE_IP='vpn.example.org'  # domain or IP
+OVPN_REMOTE_PORT=1194
+OVPN_LOCAL_IP_PREF='192.168.1'  # if client config going to be bind to some IP
+DEV=tun
+PROTO=udp
+VERB=3
+
+### Additional variables
+INITIAL_IROUTE_SUBNET='10.10.0.0/29'  # Initial subnet for client type 'router'
+LAST_IROUTE_SUBNET_FILE="${SERVER_PATH}/scripts/last_iroute_subnet"
+## Warning! Be careful - support of extended range of symbols could lead to script errors or unexpected behavior!
+# HOSTNAMES_ALLOWED_REGEX='^[A-Za-z0-9_]+$'  # Regex type of =~ bash operator (extended regular expression)
+# ALLOW_DIFFERENT_CLIENT_TYPES4HOST=no
