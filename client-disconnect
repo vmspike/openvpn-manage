@@ -1,0 +1,11 @@
+#!/bin/bash
+
+## Variables passed example see in client-connect script
+
+# Remove routes added by client-connect from routing table
+RLIST=$(ip route show via ${ifconfig_pool_remote_ip})
+[[ ${RLIST} ]] && while read ROUTE; do
+    sudo ip route del ${ROUTE} via ${ifconfig_pool_remote_ip}
+done <<< "${RLIST}"
+
+exit 0

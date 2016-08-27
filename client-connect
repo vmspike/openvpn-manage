@@ -1,0 +1,55 @@
+#!/bin/bash
+
+## Variables passed example
+# dev_type=tun
+# common_name=00033-testrouter
+# ifconfig_pool_remote_ip=172.27.0.33
+# untrusted_ip=1.2.3.4
+# ifconfig_local=172.27.0.1
+# proto_1=udp
+# tls_serial_1=13607714586095732444
+# tls_serial_0=33
+# tun_mtu=1500
+# ifconfig_netmask=255.255.0.0
+# tls_id_0=CN=00033-testrouter
+# time_unix=1466763885
+# tls_id_1=CN=CNNAMEHERE
+# redirect_gateway=0
+# script_type=client-connect
+# verb=3
+# local_port_1=1194
+# config=/etc/openvpn/server.conf
+# X509_0_CN=00033-testrouter
+# ifconfig_pool_netmask=255.255.0.0
+# dev=tun0
+# local_1=172.31.10.126
+# trusted_port=42844
+# remote_port_1=1194
+# tls_serial_hex_1=bc:d8:50:51:bd:23:46:dc
+# PWD=/etc/openvpn
+# tls_serial_hex_0=21
+# daemon=1
+# ifconfig_broadcast=172.27.255.255
+# untrusted_port=42844
+# SHLVL=1
+# script_context=init
+# daemon_start_time=1466762087
+# trusted_ip=1.2.3.4
+# daemon_pid=17235
+# time_ascii=Fri Jun 24 10:24:45 2016
+# X509_1_CN=CNNAMEHERE
+# daemon_log_redirect=1
+# tls_digest_1=2d:73:9d:57:d5:b1:a2:31:5a:02:ef:27:27:d1:8b:35:32:c0:74:55
+# tls_digest_0=9e:a7:b4:c8:3c:52:8f:6f:a8:a8:51:a2:1c:e7:82:7a:13:2f:9b:c4
+# link_mtu=1542
+
+# Add routes to routing table if iroute specified in client config
+CCD=$(grep -m1 '^client-config-dir ' "${config}" | sed -e 's/^client-config-dir[[:space:]]*//' -e 's/[[:space:]]*$//')
+IROUTES=$(grep '^iroute ' "${CCD}/${common_name}")
+[[ ${tls_serial_0} ]] && METRIC=${tls_serial_0} || METRIC=$((2**31-1))
+[[ ${IROUTES} ]] && while read IR IRIP IRMASK; do
+    # See /etc/sudoers.d/openvpn for corresponding sudo configuration
+    sudo ip route add ${IRIP}/${IRMASK} dev ${dev} via ${ifconfig_pool_remote_ip} metric ${METRIC}
+done <<<"${IROUTES}"
+
+exit 0
