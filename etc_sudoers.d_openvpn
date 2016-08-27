@@ -1,0 +1,3 @@
+Defaults:openvpn !requiretty
+openvpn ALL=(root) NOPASSWD: /sbin/ip route add * dev tun[0-9] *, /sbin/ip route del * dev tun[0-9] *, /sbin/ip route add * dev tap[0-9] *, /sbin/ip route * del dev tap[0-9] *
+openvpn ALL=(root) NOPASSWD: /usr/local/bin/openvpn-manage *
