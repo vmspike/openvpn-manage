@@ -1,0 +1,34 @@
+#!/bin/sh -e
+#
+# rc.local
+#
+# This script is executed at the end of each multiuser runlevel.
+# Make sure that the script will "exit 0" on success or any other
+# value on error.
+#
+# In order to enable or disable this script just change the execution
+# bits.
+#
+# By default this script does nothing.
+
+### Setup for openvpn server
+## Drop all forwadring packets by default
+iptables -P FORWARD DROP
+## Allow forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+DEV=$(grep -m1 '^dev ' "/etc/openvpn/server.conf" | cut -d' ' -f2)
+[ "${#DEV}" -gt 3 ] || DEV+='0'
+DEVNET=$(grep -m1 '^server ' "/etc/openvpn/server.conf" | sed -e 's/^server[[:space:]]\+//' -e 's/[[:space:]]*$//' -e 's/[[:space:]]\+/\//')
+NETBEHIND=$(grep -m1 '^push "route ' "/etc/openvpn/server/users-config" | sed -e 's/"//g' -e 's/^push[[:space:]]\+route[[:space:]]\+//' -e 's/[[:space:]]*$//' -e 's/[[:space:]]\+/\//')
+## Allow forwarding from openvpn interface to subnets behind clients-routers
+iptables -A FORWARD -i ${DEV} -s ${DEVNET} -o ${DEV} -d ${NETBEHIND} -j ACCEPT
+iptables -A FORWARD -i ${DEV} -d ${DEVNET} -o ${DEV} -s ${NETBEHIND} -j ACCEPT
+## Allow forwarding inside openvpn interface network
+## (does not required if client-to-client option specified in openvpn-server config)
+#iptables -A FORWARD -i ${DEV} -s ${DEVNET} -o ${DEV} -d ${DEVNET} -j ACCEPT
+## Allow icmp inside vpn
+iptables -A FORWARD -i ${DEV} -s ${DEVNET} -o ${DEV} -d ${DEVNET} -p icmp -j ACCEPT
+### END Setup for openvpn server
+
+exit 0
