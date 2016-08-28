@@ -1,0 +1,2 @@
+# Routes through vpn-server to all possible /29 subnets behind routers
+push "route 10.10.0.0 255.255.0.0"
