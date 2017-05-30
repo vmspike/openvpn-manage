@@ -1,0 +1,38 @@
+#!/bin/sh
+
+##
+# This script allows to share the same VPN subnet between TCP and UDP openvpn server
+# Sudoers have to be setup to allow openvpn user to change routing table.
+#
+# This file created to work in chrooted environment using busybox
+##
+
+
+# Operation: "add", "update", or "delete" based on whether or not the address is being added to, modified, or deleted from OpenVPN's internal routing table.
+MODE=$1
+
+# Address: The address being learned or unlearned.
+# This can be an IPv4 address such as "198.162.10.14",
+# an IPv4 subnet such as "198.162.10.0/24",
+# or an ethernet MAC address (when --dev tap is being used) such as "00:FF:01:02:03:04".
+IP=$2
+
+# Common Name: The common name on the certificate associated with the client linked to this address.
+# Only present for "add" or "update" operations, not "delete".
+# CN=$3
+
+# Some environmental variables also available, e.g.: dev
+
+case "${MODE}" in
+    add|update)
+        # exec -c sudo ip route add ${IP} dev ${dev} proto static scope link
+        echo "Learn: iproute del ${IP}"
+        iproute del ${IP}
+        echo "Learn: iproute add ${IP} dev ${dev} proto static scope link"
+        iproute add ${IP} dev ${dev} proto static scope link
+        ;;
+    # delete)
+    #     ;;
+    # update)
+    #     ;;
+esac
