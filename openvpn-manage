@@ -1,185 +1,209 @@
 #!/bin/bash
 
-## Requirements
-# # In addition to some trivial things like: sort cut grep sed head date wc ls ln cp mv cat
-# for e in zip tar; do  # 'expect' no longer required
-#     if ! which $e &>/dev/null; then
-#         echo "'$e' must be installed!"
-#         exit 1
-#     fi
-# done
-
-. /etc/openvpn/server/scripts/openvpn-manage.conf
-
-GRP=openvpn  # openvpn group
-
+##
+# Exit with optional message to stderr
+##
 quit() {
-    if [[ $2 ]]; then
-        echo -e "$2" >&2
-    # else
-    #     echo "Run '$(basename "$0")' for quick usage" >&2
-    fi
-    # [[ "$1" =~ ^[0-9]+$ && "$1" -le 255 ]] && exit $1 || exit 1
-    exit $1
+    [[ $2 ]] && echo "$2" >&2
+    exit "$1"
 }
 
-[[ UID -eq 0 ]] || quit 2 'Root privileges required. Otherwise you can properly setup privileges and comment this line in the script.'
 
-contains() {
-  local e
-  for e in "${@:2}"; do [[ "$e" == "$1" ]] && return 0; done
-  return 1
-}
+##
+# Convert decimal number to IPv4 address
+##
+dec2ip() {
+    local _var _res _e _dot _octet _dec
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
 
-dec2ip () {
-    # Convert decimal number to IP
-    local IP DELIM OCTET DEC=$@
-    for e in {3..0}; do
-        (( OCTET = DEC/(256**e) ))
-        (( DEC -= OCTET*256**e ))
-        IP+=${DELIM}${OCTET}
-        DELIM=.
+    _dec=$1
+    for _e in {3..0}; do
+        (( _octet = _dec/256**_e ))
+        (( _dec -= _octet*256**_e ))
+        _res+=${_dot}${_octet}
+        _dot=.
     done
-    printf '%s\n' "$IP"
+
+    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
 }
 
-ip2dec () {
-    # Convert IP to decimal number
-    local A B C D IP=$@
-    IFS=. read -r A B C D <<<"$IP"
-    printf '%d\n' "$((A*256**3 + B*256**2 + C*256 + D))"
+
+##
+# Convert IPv4 address to decimal number
+##
+ip2dec() {
+    local _var _res _a _b _c _d
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
+
+    IFS=. read -r _a _b _c _d <<<"$1"
+    (( _res = _a*256**3 + _b*256**2 + _c*256 + _d ))
+
+    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
 }
 
-mask2cidr ()
-{
-   # Assumes there is no "255." after a non-255 byte in the mask, so no gaps
-   local x=${1##*255.}
-   set -- 0^^^128^192^224^240^248^252^254^ $(( (${#1} - ${#x})*2 )) ${x%%.*}
-   x=${1%%$3*}
-   echo $(( $2 + (${#x}/4) ))
+
+##
+# Convert IPv4 MASK to CIDR
+# Assumes that MASK have no gaps.
+##
+mask2cidr() {
+    local _var _res _x
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
+
+    _x=${1##*255.}
+    set -- 0^^^128^192^224^240^248^252^254^ $(( (${#1}-${#_x})*2 )) "${_x%%.*}"
+    _x=${1%%$3*}
+    (( _res = $2 + ${#_x}/4 ))
+
+    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
 }
 
-cidr2mask ()
-{
-   # Number of args to shift, 255..255, first non-255 byte, zeros
-   set -- $(( 5 - ($1 / 8) )) 255 255 255 255 $(( (255 << (8 - ($1 % 8))) & 255 )) 0 0 0
-   [ $1 -gt 1 ] && shift $1 || shift
-   echo ${1-0}.${2-0}.${3-0}.${4-0}
+
+##
+# Convert CIDR to IPv4 MASK
+##
+cidr2mask() {
+    local _var _res
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
+    [[ -z $1 ]] && set 0
+
+    set -- $(( 5-($1/8) )) 255 255 255 255 $(( (255<<(8 - ($1%8)))&255 )) 0 0 0
+    if (($1 > 1)); then shift "$1"; else shift; fi
+    _res=${1:-0}.${2:-0}.${3:-0}.${4:-0}
+
+    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
 }
 
+
+##
+# Return next subnet with the same size
+# Subnet format is IPv4/CIDR
+##
 increment_subnet() {
-    # Return next subnet with the same size
-    # Subnet format is IP/CIDR
-    # $1 is subnet for increment
-    local IP=$(cut -d/ -f1 <<<"$1")
-    local CIDR=$(cut -d/ -f2 <<<"$1")
-    local SIZE=$((2**(32-CIDR)))  # all IPs count inside subnet e.g. /29 size is 8
-    local DECIP=$((SIZE+$(ip2dec $IP)))
-    echo $(dec2ip ${DECIP})/${CIDR}
+    local _var _res _ip _cidr _size _ip_dec _ip_next
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
+
+    _ip=${1%/*}
+    _cidr=${1#*/}
+    (( _size = 2**(32-_cidr) ))  # all IPs count inside subnet e.g. /29 size is 8
+    ip2dec -v _ip_dec "${_ip}"
+    dec2ip -v _ip_next $((_size+_ip_dec))
+    _res=${_ip_next}/${_cidr}
+
+    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
 }
 
-# validate_ip4() {
-#     # Invalid examples: 192.168.000.001 256.0.a.01. trash
-#     local A B C D IP=$1 re
-#     if [[ $IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-#         IFS=. read -r A B C D <<<"$IP"
-#         # Disallow leading zeros
-#         re='^0[0-9]+$'
-#         [[ ${A} =~ ${re} || ${B} =~ ${re} || ${C} =~ ${re} || ${D} =~ ${re} ]] && return 1
-#         [[ ${A} -lt 256 && ${B} -lt 256 && ${C} -lt 256 && ${D} -lt 256 ]] || return 1
-#         return 0
-#     fi
-#     return 1
-# }
+
+##
+# Validate IPv4 address
+# Note: this is invalid address: 192.168.000.001
+##
 validate_ip4() {
-    local re='^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$'
-    [[ "$1" =~ ${re} ]] && return 0 || return 1
+    local _re
+    _re='^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$'
+    [[ "$1" =~ ${_re} ]] && return 0 || return 1
 }
 
-# validate_ip4cidr() {
-#     # Valid example: 192.168.0.1/24
-#     local IP=$(cut -d/ -f1 <<<"$1")
-#     local CIDR=$(cut -d/ -f2 <<<"$1")
-#     if [[ "$CIDR" =~ ^([1-2]?[0-9]|3[0-2])$ ]]; then
-#         validate_ip4 "$IP"
-#         return $?
-#     fi
-#     return 1
-# }
+
+##
+# Validate IPv4/CIDR
+##
 validate_ip4cidr() {
-    local re='^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\/([0-9]|[1-2][0-9]|3[0-2])$'
-    [[ "$1" =~ ${re} ]] && return 0 || return 1
+    local _re
+    _re='^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\/([0-9]|[1-2][0-9]|3[0-2])$'
+    [[ "$1" =~ ${_re} ]] && return 0 || return 1
 }
 
+
+##
+# Usage: validate_host_name host_name [regex]
+##
 validate_host_name() {
-    local re
+    local _re
     if [[ $2 ]]; then
-        re=$2
-    elif [[ ${HOSTNAMES_ALLOWED_REGEX} ]]; then
-        re=${HOSTNAMES_ALLOWED_REGEX}
+        _re=$2
+    elif [[ ${HOST_NAME_ALLOWED_REGEX} ]]; then
+        _re=${HOST_NAME_ALLOWED_REGEX}
     else
-        re='^[A-Za-z0-9_]+$'
+        _re='^[A-Za-z0-9_-]+$'  # Default regex
     fi
-    [[ "$1" =~ ${re} ]] || quit 1 "Host name restricted to match the following regexp: ${re}"
+    [[ "$1" =~ ${_re} ]] || quit 1 "Host name restricted to match the following regex: ${_re}"
     return 0
 }
 
+
+##
+# Validate that client name starts with 5 digits and '-' then.
+# Values '00000-' and '00001-' treated as invalid.
+# Include host name validation.
+##
 validate_client_name() {
-    local R N
-    R='^[0-9]+-$'
-    N=${1::6}
-    [[ "${N}" =~ ${R} && "${N}" != '00000-' && "${N}" != '00001-' ]] || quit 1 "First 6 symbols of client name must match the following regexp: ${R}"
+    local _re _N
+    _re='^[0-9]+-$'
+    _N=${1::6}
+    [[ "${_N}" =~ ${_re} && "${_N}" != '00000-' && "${_N}" != '00001-' ]] || quit 1 "First 6 symbols of client name must match the following regex: ${_re}"
     validate_host_name "${1:6}" || return 1
     return 0
 }
 
+
 revoke_cert() {
-    local cn=$1
-    if ! [[ -f "${EASYRSA}/pki/issued/${cn}.crt" ]]; then
-        quit 1 "No such cert: ${cn}"
-    fi
-    if ! grep -q -E "^R[[:space:]]*[[:digit:]]*Z.*/CN=${cn}(/.*)?$" "${EASYRSA}/pki/index.txt"; then
-        ./easyrsa --batch revoke "${cn}" &>${DESCRIPTOR}
-        [[ $? -eq 0 ]] && echo "${cn}: cert revoked" || quit 1 "${cn}: failed to revoke cert"
+    local _cn
+    _cn=$1
+    [[ -f "${EASYRSA}/pki/issued/${_cn}.crt" ]] || quit 1 "No such cert: ${_cn}"
+    if ! grep -qE "^R[[:space:]]*[[:digit:]]*Z.*/CN=${_cn}(/.*)?$" "${EASYRSA}/pki/index.txt"; then
+        ./easyrsa --batch revoke "${_cn}" &>"${DESCRIPTOR}"
+        if (($?)); then
+            quit 1 "${_cn}: failed to revoke cert"
+        else
+            echo "${_cn}: cert revoked"
+        fi
     else
-        echo "${cn}: cert already revoked!"
+        echo "${_cn}: cert already revoked!"
     fi
 }
+
 
 disable_client() {
-    local cn=$1
-    if ! grep -q '^disable$' "${CLIENT_CONFIGS}/${cn}"; then
-        echo disable >>"${CLIENT_CONFIGS}/${cn}"
-        echo "${cn}: disabled"
+    local _cn
+    _cn=$1
+    if ! grep -q '^disable$' "${CLIENT_CONFIG_DIR}/${_cn}"; then
+        echo disable >>"${CLIENT_CONFIG_DIR}/${_cn}"
+        echo "${_cn}: disabled"
     else
-        echo "${cn}: already disabled!"
+        echo "${_cn}: was already disabled!"
     fi
 }
+
 
 enable_client() {
-    local cn=$1
-    if grep -q '^disable$' "${CLIENT_CONFIGS}/${cn}"; then
-        sed -i '/^disable$/d' "${CLIENT_CONFIGS}/${cn}"
-        echo "${cn}: enabled"
+    local _cn
+    _cn=$1
+    if grep -q '^disable$' "${CLIENT_CONFIG_DIR}/${_cn}"; then
+        sed -i '/^disable$/d' "${CLIENT_CONFIG_DIR}/${_cn}"
+        echo "${_cn}: enabled"
     else
-        echo "${cn}: already enabled!"
+        echo "${_cn}: was already enabled!"
     fi
 }
 
+
 populate_subnet_var() {
-    local CN=$1
-    ROUTERSLST=$(grep -l '^iroute ' "${CLIENT_CONFIGS}/"*"-${CN}")
-    if [[ $? -eq 0 ]]; then  # Other routers exists for this host
+    local _cn CLIENT_SUBNET_BEHIND_IP CLIENT_SUBNET_BEHIND_CIDR ROUTERS_LIST FIRST_ROUTER
+    _cn=$1
+    ROUTERS_LIST=$(exec -c grep -l '^iroute ' "${CLIENT_CONFIG_DIR}/"*"-${_cn}")
+    if (($? == 0)); then  # Other routers exists for this host
         # Get subnet from first available router config of this host!
-        CLIENT_SUBNET_BEHIND=$(grep -m1 '^iroute ' "$(head -1 <<<"${ROUTERSLST}")" | cut -d' ' -f2-)
-        local CLIENT_SUBNET_BEHIND_IP=$(cut -d' ' -f1 <<<"${CLIENT_SUBNET_BEHIND}")
-        local CLIENT_SUBNET_BEHIND_CIDR=$(mask2cidr $(cut -d' ' -f2 <<<"${CLIENT_SUBNET_BEHIND}"))
+        read -r FIRST_ROUTER <<<"${ROUTERS_LIST}"
+        CLIENT_SUBNET_BEHIND=$(exec -c grep -m1 '^iroute ' "${FIRST_ROUTER}")
+        CLIENT_SUBNET_BEHIND=${CLIENT_SUBNET_BEHIND#iroute }
+        CLIENT_SUBNET_BEHIND_IP=${CLIENT_SUBNET_BEHIND%% *}
+        mask2cidr -v CLIENT_SUBNET_BEHIND_CIDR ${CLIENT_SUBNET_BEHIND#* }
         CLIENT_SUBNET_BEHIND=${CLIENT_SUBNET_BEHIND_IP}/${CLIENT_SUBNET_BEHIND_CIDR}
-        unset CLIENT_SUBNET_BEHIND_IP CLIENT_SUBNET_BEHIND_CIDR
     else  # It's only router for this host: autoincrement subnet
         # Increment last saved subnet
         if [[ -f "${LAST_IROUTE_SUBNET_FILE}" ]]; then
-            CLIENT_SUBNET_BEHIND=$(increment_subnet "$(< "${LAST_IROUTE_SUBNET_FILE}")")
+            increment_subnet -v CLIENT_SUBNET_BEHIND "$(< "${LAST_IROUTE_SUBNET_FILE}")"
         else
             CLIENT_SUBNET_BEHIND=${INITIAL_IROUTE_SUBNET}
         fi
@@ -189,19 +213,17 @@ populate_subnet_var() {
     fi
 }
 
+
 update_client() {
     # Update client type and/or subnet
-    local cn=$1 OLD_CLIENT_TYPE OLD_IROUTE ROUTERSLST
-    local OLD_CLIENT_SUBNET_BEHIND OLD_CLIENT_SUBNET_BEHIND_IP OLD_CLIENT_SUBNET_BEHIND_CIDR
-    # local CLIENT_TYPE=$2
-    # local CLIENT_SUBNET_BEHIND=$3
-    if grep -q '^iroute ' "${CLIENT_CONFIGS}/${cn}"; then
+    local _cn OLD_CLIENT_TYPE OLD_IROUTE CLIENT_SUBNET_BEHIND_IP CLIENT_SUBNET_BEHIND_MASK OLD_CLIENT_SUBNET_BEHIND OLD_CLIENT_SUBNET_BEHIND_IP OLD_CLIENT_SUBNET_BEHIND_CIDR
+    _cn=$1
+    if grep -q '^iroute ' "${CLIENT_CONFIG_DIR}/${_cn}"; then
         OLD_CLIENT_TYPE=router
-
-        OLD_IROUTE=$(grep -m1 '^iroute ' "${CLIENT_CONFIGS}/${cn}")
-        OLD_CLIENT_SUBNET_BEHIND=$(grep -m1 '^iroute ' "${CLIENT_CONFIGS}/${cn}" | cut -d' ' -f2-)
-        OLD_CLIENT_SUBNET_BEHIND_IP=$(cut -d' ' -f1 <<<"${OLD_CLIENT_SUBNET_BEHIND}")
-        OLD_CLIENT_SUBNET_BEHIND_CIDR=$(mask2cidr $(cut -d' ' -f2 <<<"${OLD_CLIENT_SUBNET_BEHIND}"))
+        OLD_IROUTE=$(exec -c grep -m1 '^iroute ' "${CLIENT_CONFIG_DIR}/${_cn}")
+        OLD_CLIENT_SUBNET_BEHIND=${OLD_IROUTE#iroute }
+        OLD_CLIENT_SUBNET_BEHIND_IP=${OLD_CLIENT_SUBNET_BEHIND%% *}
+        mask2cidr -v OLD_CLIENT_SUBNET_BEHIND_CIDR ${OLD_CLIENT_SUBNET_BEHIND#* }
         OLD_CLIENT_SUBNET_BEHIND=${OLD_CLIENT_SUBNET_BEHIND_IP}/${OLD_CLIENT_SUBNET_BEHIND_CIDR}
     else
         OLD_CLIENT_TYPE=user
@@ -210,79 +232,79 @@ update_client() {
     case "${CLIENT_TYPE}" in
         user)
             if [[ "${CLIENT_TYPE}" != "${OLD_CLIENT_TYPE}" ]]; then  # router -> user
-                sed -i -e '/^iroute /d' -e "1 a config ${CLIENT_CONFIG_USERS}" "${CLIENT_CONFIGS}/${cn}"
-                echo "${cn}: type changed to ${CLIENT_TYPE}"
+                sed -i -e '/^iroute /d' -e "1 a config ${USERS_CONF_IN_CHROOT}" "${CLIENT_CONFIG_DIR}/${_cn}"
+                echo "${_cn}: type changed to ${CLIENT_TYPE}"
             else  # user -> user: nothing to change
-                echo "${cn}: type is already ${CLIENT_TYPE}!"
+                echo "${_cn}: type is already ${CLIENT_TYPE}!"
             fi
             ;;
         router)
             if [[ -z "${CLIENT_SUBNET_BEHIND}" ]]; then
-                populate_subnet_var "${cn:6}"
+                populate_subnet_var "${_cn:6}"
             fi
 
-            local CLIENT_SUBNET_BEHIND_IP=$(cut -d/ -f1 <<<"${CLIENT_SUBNET_BEHIND}")
-            local CLIENT_SUBNET_BEHIND_MASK=$(cidr2mask $(cut -d/ -f2 <<<"${CLIENT_SUBNET_BEHIND}"))
+            CLIENT_SUBNET_BEHIND_IP=${CLIENT_SUBNET_BEHIND%%/*}
+            cidr2mask -v CLIENT_SUBNET_BEHIND_MASK ${CLIENT_SUBNET_BEHIND#*/}
             if [[ "${CLIENT_TYPE}" != "${OLD_CLIENT_TYPE}" ]]; then  # user -> router
-                sed -i -e '/^config /d' -e "1 a iroute ${CLIENT_SUBNET_BEHIND_IP} ${CLIENT_SUBNET_BEHIND_MASK}" "${CLIENT_CONFIGS}/${cn}"
-                echo "${cn}: internal subnet changed to ${CLIENT_SUBNET_BEHIND}"
+                sed -i -e '/^config /d' -e "1 a iroute ${CLIENT_SUBNET_BEHIND_IP} ${CLIENT_SUBNET_BEHIND_MASK}" "${CLIENT_CONFIG_DIR}/${_cn}"
+                echo "${_cn}: internal subnet changed to ${CLIENT_SUBNET_BEHIND}"
             else  # router -> router: change router subnet only
                 if [[ "${OLD_CLIENT_SUBNET_BEHIND}" != "${CLIENT_SUBNET_BEHIND}" ]]; then
-                    sed -i "s/${OLD_IROUTE}/iroute ${CLIENT_SUBNET_BEHIND_IP} ${CLIENT_SUBNET_BEHIND_MASK}/" "${CLIENT_CONFIGS}/${cn}"
-                    echo "${cn}: internal subnet changed to ${CLIENT_SUBNET_BEHIND}"
+                    sed -i "s/${OLD_IROUTE}/iroute ${CLIENT_SUBNET_BEHIND_IP} ${CLIENT_SUBNET_BEHIND_MASK}/" "${CLIENT_CONFIG_DIR}/${_cn}"
+                    echo "${_cn}: internal subnet changed to ${CLIENT_SUBNET_BEHIND}"
                 else
-                    echo "${cn}: already has internal subnet ${CLIENT_SUBNET_BEHIND}!"
+                    echo "${_cn}: already has internal subnet ${CLIENT_SUBNET_BEHIND}!"
                 fi
             fi
             ;;
     esac
 
     # Enable/disable if -e|-d specified
-    [[ "${ENABLED}" == yes ]] && enable_client "${cn}"
-    [[ "${ENABLED}" == no ]] && disable_client "${cn}"
+    [[ "${ENABLED}" == yes ]] && enable_client "${_cn}"
+    [[ "${ENABLED}" == no ]] && disable_client "${_cn}"
 }
 
-show_client() {
-    local CLIENTNAME=$1 ENABLED VALID_CERT CLIENT_TYPE IROUTES IP CIDR USERS_CONF line n N
-    local SUBNET=''
-    local CLIENT_CONFIG="${CLIENT_CONFIGS}/${CLIENTNAME}"
-    local CC=$(< "${CLIENT_CONFIG}")
 
-    if grep -q '^disable$' <<<"${CC}"; then
+show_client() {
+    local CLIENT_NAME ENABLED VALID_CERT CLIENT_TYPE IROUTES IROUTE IP CIDR USERS_CONF_LINE line n N SUBNET CLIENT_CONFIG CCC
+    SUBNET=''
+    CLIENT_NAME=$1
+    CLIENT_CONFIG="${CLIENT_CONFIG_DIR}/${CLIENT_NAME}"
+    CCC=$(< "${CLIENT_CONFIG}")
+
+    if grep -q '^disable$' <<<"${CCC}"; then
         ENABLED=no
     else
         ENABLED=yes
     fi
 
-    IROUTES=$(grep '^iroute ' <<<"${CC}")
-    if [[ $? -eq 0 ]]; then
+    IROUTES=$(exec -c grep '^iroute ' <<<"${CCC}")
+    if (($? == 0)); then
         CLIENT_TYPE=router
         while read IROUTE; do
-            IP=$(cut -d' ' -f2 <<<"${IROUTE}")
-            CIDR=$(mask2cidr $(cut -d' ' -f3 <<<"${IROUTE}"))
+            IROUTE=${IROUTE#iroute }
+            IP=${IROUTE%% *}
+            mask2cidr -v CIDR ${IROUTE#* }
             [[ ${SUBNET} ]] && SUBNET+=','
             SUBNET+="${IP}/${CIDR}"
         done <<<"${IROUTES}"
-    # else
-    #     # It's not correct in general. Type client for sure if no iroutes and 'config */users-config' exist
-    #     CLIENT_TYPE=user
     fi
-    USERS_CONF=$(grep "^config ${CLIENT_CONFIG_USERS}$" <<<"${CC}")
-    if [[ $? -eq 0 ]]; then
+    USERS_CONF_LINE=$(exec -c grep "^config ${USERS_CONF_IN_CHROOT}$" <<<"${CCC}")
+    if (($? == 0)); then
         CLIENT_TYPE=user
     fi
-    if [[ -n "${IROUTES}" && -n "${USERS_CONF}" ]]; then
+    if [[ -n "${IROUTES}" && -n "${USERS_CONF_LINE}" ]]; then
         CLIENT_TYPE=mixed
-    elif [[ -z "${IROUTES}" && -z "${USERS_CONF}" ]]; then
+    elif [[ -z "${IROUTES}" && -z "${USERS_CONF_LINE}" ]]; then
         CLIENT_TYPE=unspecified
     fi
 
-    N=$((10#${CLIENTNAME::5}))
+    (( N = 10#${CLIENT_NAME::5} ))
     n=0
     while read line; do
         ((n++))
         if [[ ${n} -eq ${N} ]]; then
-            if [[ ${line::1} == R ]]; then
+            if [[ "${line::1}" == 'R' ]]; then
                 VALID_CERT=no
             else
                 VALID_CERT=yes
@@ -291,7 +313,7 @@ show_client() {
         fi
     done <"${EASYRSA}/pki/index.txt"
 
-    echo "${CLIENTNAME}:
+    echo "${CLIENT_NAME}:
     Server side config: ${CLIENT_CONFIG}
     Enabled: ${ENABLED}
     Valid cert: ${VALID_CERT}
@@ -300,74 +322,66 @@ show_client() {
         echo "    Internal subnets: ${SUBNET}"
     fi
     if [[ "${CLIENT_TYPE}" == 'user' || "${CLIENT_TYPE}" == 'mixed' ]]; then
-        echo "    Users shared config: ${CLIENT_CONFIG_USERS}"
+        echo "    Users shared config: ${USERS_CONF}"
     fi
 }
 
+
 add_client() {
-    local HOSTNAME=$1
-    local FLNUMBER=$(printf '%05d' $((16#$(< "${EASYRSA}/pki/serial"))))
-    local NUMBER=$((10#${FLNUMBER}))
-    local USER="${FLNUMBER}-${HOSTNAME}"
-    local CLIENT_CONFIG_NAME="${USER}.${CLIENT_CONFIG_EXT}"
+    local HOST_NAME FLNUMBER NUMBER USER CLIENT_CONFIG_NAME DEC_IP srv TMP_USER_DIR
+    HOST_NAME=$1
+    printf -v FLNUMBER '%05d' $(( 16#$(< "${EASYRSA}/pki/serial") ))
+    (( NUMBER = 10#${FLNUMBER} ))
+    USER="${FLNUMBER}-${HOST_NAME}"
+    case "${CLIENT_OS}" in
+        windows)
+            CLIENT_CONFIG_NAME="${USER}.ovpn"
+            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOF${BR}${WIN_SPECIFIC_OPTIONS}${BR}EOF"
+            ;;
+        *)
+            CLIENT_CONFIG_NAME="${USER}.conf"
+            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOF${BR}${NIX_SPECIFIC_OPTIONS}${BR}EOF"
+    esac
+
     cd "${EASYRSA}"
 
-    ./easyrsa --batch --req-cn="${USER}" gen-req "${USER}" nopass &>${DESCRIPTOR} || quit 1 "Easyrsa error: $?"
-    # ./easyrsa --batch gen-req "${USER}" nopass &>${DESCRIPTOR}
-#     expect <<EOF &>${DESCRIPTOR}
-# spawn -noecho ./easyrsa gen-req "${USER}" nopass
-# expect -re "Common Name .*${HOSTNAME}\]:"
-# send "\r"
-# wait
-# close
-# EOF
-# sed -e '/^You are about to be asked/,/the field will be left blank.$/d' -e '/^-----/d' -e '/\.\.\+\+\+/d' -e '/^\s*$/d' -e '/Generating a /d' -e '/^writing new private key to/d'
-
-    ./easyrsa --batch --req-cn="${USER}" sign-req client "${USER}" &>${DESCRIPTOR} || quit 1 "Easyrsa error: $?"
-    # ./easyrsa --batch sign-req client "${USER}" &>${DESCRIPTOR}
-#     expect <<EOF &>${DESCRIPTOR}
-# spawn -noecho ./easyrsa sign-req client "${USER}"
-# expect "Confirm request details: "
-# send "yes\r"
-# wait
-# close
-# EOF
-# sed -e '/^You are about to sign the/,/to be signed as a client certificate for \d* days:/d' -e '/^Type the word /,/  Confirm request details:/d' -e '/^\s*$/d'
+    ./easyrsa --batch --req-cn="${USER}" gen-req "${USER}" nopass &>"${DESCRIPTOR}" || quit 1 "Easyrsa error: $?"
+    ./easyrsa --batch --req-cn="${USER}" sign-req client "${USER}" &>"${DESCRIPTOR}" || quit 1 "Easyrsa error: $?"
 
     # Change CN in Authority Key Identifier DirName for compatibility with Netcomm routers openvpn interface
     sed -i -e "s/\/CN=server\//\/CN=${USER}\//" -e "s/\/CN=server$/\/CN=${USER}/" "${EASYRSA}/pki/issued/${USER}.crt"
 
-    # mkdir -p "${EASYRSA}/temp"
-    # rm -rf "${EASYRSA}/temp/*"
-
     # Calculate client OVPN IP and NETMASK
-    CLIENT_OVPN_IP=$(dec2ip $(($(ip2dec $(grep -m1 '^server ' "${SERVER_CONF}" | cut -d' ' -f2))+${NUMBER})))
-    NETMASK=$(grep -m1 '^server ' "${SERVER_CONF}" | cut -d' ' -f3)
+    srv=$(exec -c grep -m1 '^server ' "${SERVER_CONF}")
+    srv=${srv#server }
+    srv=${srv% nopool*}
+    ip2dec -v DEC_IP ${srv%% *}
+    dec2ip -v CLIENT_OVPN_IP $((DEC_IP+NUMBER))
+    NETMASK=${srv#* }
 
     ## Number for ethN and tunN, first host cert will have N=0, 2nd - N=1 etc.
-    N=$(ls -1 "${CLIENT_CONFIGS}"/*-"${HOSTNAME}" 2>/dev/null | wc -l)
+    N=$(ls -1 "${CLIENT_CONFIG_DIR}"/*-"${HOST_NAME}" 2>/dev/null | wc -l)
 
     # Create symlinks if possible, copy otherwise
-    if ln -s "${EASYRSA}/pki/issued/${USER}.crt" "${CLIENT_KEYS}" >/dev/null; then
-        ln -s "${EASYRSA}/pki/private/${USER}.key" "${CLIENT_KEYS}"
+    if ln -s "${EASYRSA}/pki/issued/${USER}.crt" "${CLIENT_KEYS_DIR}" >/dev/null; then
+        ln -s "${EASYRSA}/pki/private/${USER}.key" "${CLIENT_KEYS_DIR}"
     else
-        cp "${EASYRSA}/pki/issued/${USER}.crt" "${EASYRSA}/pki/private/${USER}.key" "${CLIENT_KEYS}"
+        cp "${EASYRSA}/pki/issued/${USER}.crt" "${EASYRSA}/pki/private/${USER}.key" "${CLIENT_KEYS_DIR}"
     fi
-    echo "ifconfig-push ${CLIENT_OVPN_IP} ${NETMASK}" >"${CLIENT_CONFIGS}/${USER}"
+    echo "ifconfig-push ${CLIENT_OVPN_IP} ${NETMASK}" >"${CLIENT_CONFIG_DIR}/${USER}"
 
     case "${CLIENT_TYPE}" in
-        'user')
-            echo "config ${CLIENT_CONFIG_USERS}" >>"${CLIENT_CONFIGS}/${USER}"
+        user)
+            echo "config ${USERS_CONF_IN_CHROOT}" >>"${CLIENT_CONFIG_DIR}/${USER}"
         ;;
-        'router')
-            CLIENT_SUBNET_BEHIND_IP=$(cut -d/ -f1 <<<"${CLIENT_SUBNET_BEHIND}")
-            CLIENT_SUBNET_BEHIND_MASK=$(cidr2mask $(cut -d/ -f2 <<<"${CLIENT_SUBNET_BEHIND}"))
-            echo "iroute ${CLIENT_SUBNET_BEHIND_IP} ${CLIENT_SUBNET_BEHIND_MASK}" >>"${CLIENT_CONFIGS}/${USER}"
-            ROUTER_CONF_STR="
-# On config creation time vpn-server used the following internal subnet for this client:
-# ${CLIENT_SUBNET_BEHIND}
-# It should match real internal subnet if you want allow vpn-users access it.
-# Forwarding should be enabled for vpn<->subnet interfaces."
+        router)
+            CLIENT_SUBNET_BEHIND_IP=${CLIENT_SUBNET_BEHIND%%/*}
+            cidr2mask -v CLIENT_SUBNET_BEHIND_MASK ${CLIENT_SUBNET_BEHIND#*/}
+            echo "iroute ${CLIENT_SUBNET_BEHIND_IP} ${CLIENT_SUBNET_BEHIND_MASK}" >>"${CLIENT_CONFIG_DIR}/${USER}"
+            ROUTER_CONF_STR='# On config creation time vpn-server used the following internal subnet for this client:'
+            ROUTER_CONF_STR+="# ${CLIENT_SUBNET_BEHIND}"
+            ROUTER_CONF_STR+='# It should match real internal subnet if you want allow vpn-users access it.'
+            ROUTER_CONF_STR+='# Forwarding should be enabled for vpn<->subnet interfaces.'
         ;;
     esac
 
@@ -375,96 +389,55 @@ add_client() {
         disable_client "${USER}"
     fi
 
-    chown :${GRP} "${CLIENT_CONFIGS}/${USER}"
-    chmod 640 "${CLIENT_CONFIGS}/${USER}"
+    chown :"${OPENVPN_GROUP}" "${CLIENT_CONFIG_DIR}/${USER}"
+    chmod 640 "${CLIENT_CONFIG_DIR}/${USER}"
 
-    # chown :${GRP} "${EASYRSA}/pki/index.txt"
+    # chown :${OPENVPN_GROUP} "${EASYRSA}/pki/index.txt"
     # chmod 640 "${EASYRSA}/pki/index.txt"
     # chmod og+x "${EASYRSA}/pki"{,/issued,/private}
 
-    # cp "${EASYRSA}/pki/issued/${USER}.crt" "${EASYRSA}/pki/private/${USER}.key" "${KEYS_PATH}/ca.crt" "${KEYS_PATH}/ta.key" temp
-    mkdir -p "${CLIENT_PACKS}/${HOSTNAME}"
+    # cp "${EASYRSA}/pki/issued/${USER}.crt" "${EASYRSA}/pki/private/${USER}.key" "${KEYS_DIR}/ca.crt" "${KEYS_DIR}/ta.key" temp
+    mkdir -p "${CLIENT_PACKS_DIR}/${HOST_NAME}"
 
-    # All-in-one client config
-    cat <<EOF >"${CLIENT_PACKS}/${HOSTNAME}/${CLIENT_CONFIG_NAME}"
-# ${COMPANY} openvpn-client ${CLIENT_TYPE} config file ${N} for host "${HOSTNAME}"
-${ROUTER_CONF_STR}
+    # Write client config
+    eval "read -rd '' CLIENT_CONFIG <<EOF${BR}${CLIENT_CONFIG_TEMPLATE}${BR}EOF"
+    echo "${CLIENT_CONFIG}" >"${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
+    # (set -o posix; set) >&2
 
-client
-;dev ${DEV}${N}
-dev ${DEV}
-;local ${OVPN_LOCAL_IP_PREF}.$((N%245+10))
-nobind
-remote ${OVPN_REMOTE_IP} ${OVPN_REMOTE_PORT}
-proto ${PROTO}
-resolv-retry infinite
-remote-cert-tls server
-comp-lzo
-verb ${VERB}
-;log-append '/var/log/openvpn/${USER}.log'
-;daemon
-
-# Run as unprivileged user
-;user openvpn
-;group openvpn
-;persist-key
-;persist-tun
-
-# Certs
-;ca '/etc/openvpn/ca.crt'
-<ca>
-$(< "${SERVER_PATH}/keys/ca.crt")
-</ca>
-
-;cert '/etc/openvpn/${USER}.crt'
-<cert>
-$(< "${EASYRSA}/pki/issued/${USER}.crt")
-</cert>
-
-;key '/etc/openvpn/${USER}.key'
-<key>
-$(< "${EASYRSA}/pki/private/${USER}.key")
-</key>
-
-;tls-auth '/etc/openvpn/ta.key' 1
-key-direction 1
-<tls-auth>
-$(< "${SERVER_PATH}/keys/ta.key")
-</tls-auth>
-EOF
-
-    # .zip pack beside all-in-on config
+    # .zip pack beside all-in-one config
     # Include:
     #     ${USER}.tgz with ca.crt ${USER}.key ${USER}.crt
     #     ta.key
     #     ${USER} all-in-one conf
-    mkdir -p "/tmp/${USER}/"
-    tar --transform 's/.*\///g' -zchf "/tmp/${USER}/${USER}.tgz" "./pki/private/${USER}.key" "./pki/issued/${USER}.crt" ./pki/ca.crt &>${DESCRIPTOR}
-    cp -l  ./pki/ta.key "${CLIENT_PACKS}/${HOSTNAME}/${CLIENT_CONFIG_NAME}" "/tmp/${USER}/" &>${DESCRIPTOR} || \
-        cp ./pki/ta.key "${CLIENT_PACKS}/${HOSTNAME}/${CLIENT_CONFIG_NAME}" "/tmp/${USER}/" &>${DESCRIPTOR}
-    zip -rjD "${CLIENT_PACKS}/${HOSTNAME}/${USER}.zip" "/tmp/${USER}/" &>${DESCRIPTOR}
-    rm "/tmp/${USER}/"{"${USER}.tgz",ta.key,"${CLIENT_CONFIG_NAME}"} &>${DESCRIPTOR} && rm -r "/tmp/${USER}/" &>${DESCRIPTOR}
+    TMP_USER_DIR="/tmp/openvpn-manage/${USER}"
+    mkdir -p "${TMP_USER_DIR}"
+    tar --transform 's/.*\///g' -zchf "${TMP_USER_DIR}/${USER}.tgz" "./pki/private/${USER}.key" "./pki/issued/${USER}.crt" ./pki/ca.crt &>"${DESCRIPTOR}"
+    cp -l ./pki/ta.key "${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}" "${TMP_USER_DIR}/" &>"${DESCRIPTOR}" || \
+        cp ./pki/ta.key "${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}" "${TMP_USER_DIR}/" &>"${DESCRIPTOR}"
+    zip -rjD "${CLIENT_PACKS_DIR}/${HOST_NAME}/${USER}.zip" "${TMP_USER_DIR}/" &>"${DESCRIPTOR}"
+    rm "${TMP_USER_DIR}/"{"${USER}.tgz",ta.key,"${CLIENT_CONFIG_NAME}"} &>"${DESCRIPTOR}" && rm -r "${TMP_USER_DIR}/" &>"${DESCRIPTOR}"
 
-    [[ ${DESCRIPTOR} == /dev/null ]] || echo -e '\n\n'
-    # echo "${USER}: config pack created:\n${CLIENT_PACKS}/${USER}.zip\n"
-    echo -e "${USER}: config created:\n${CLIENT_PACKS}/${HOSTNAME}/${CLIENT_CONFIG_NAME}"
+    [[ ${DESCRIPTOR} == /dev/null ]] || echo "${BR}${BR}"
+    echo "${USER}: config created:${BR}${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
     cd - >/dev/null
 }
 
+
 create_host() {
-    local HOSTNAME=$1 COUNT INCSUB
+    local HOST_NAME COUNT INCSUB
+    HOST_NAME=$1
     [[ $2 ]] && COUNT=$2 || COUNT=1
-    if [[ "$COUNT" -le 0 ]]; then
+    if (( COUNT <= 0 )); then
         quit 1 "Invalid COUNT: ${COUNT}"
     fi
 
-    for n in $(seq 1 ${COUNT}); do
+    for ((n=1;n<=COUNT;++n)); do
         INCSUB=no  # Is subnet was incremented?
         if [[ "${CLIENT_TYPE}" == router ]]; then
             if [[ -z "${CLIENT_SUBNET_BEHIND}" ]]; then
                 # Increment last saved subnet
                 if [[ -f "${LAST_IROUTE_SUBNET_FILE}" ]]; then
-                    CLIENT_SUBNET_BEHIND=$(increment_subnet "$(< "${LAST_IROUTE_SUBNET_FILE}")")
+                    increment_subnet -v CLIENT_SUBNET_BEHIND "$(< "${LAST_IROUTE_SUBNET_FILE}")"
                 else
                     CLIENT_SUBNET_BEHIND=${INITIAL_IROUTE_SUBNET}
                 fi
@@ -475,7 +448,7 @@ create_host() {
             fi
         fi
 
-        add_client "${HOSTNAME}"
+        add_client "${HOST_NAME}"
 
         if [[ $? -eq 0 && "${INCSUB}" == yes ]]; then
             [[ -f "${LAST_IROUTE_SUBNET_FILE}" ]] && mv "${LAST_IROUTE_SUBNET_FILE}"{,.old}
@@ -488,74 +461,99 @@ create_host() {
         echo
     done
 
-    zip -rjD "${CLIENT_PACKS}/${HOSTNAME}.zip" "${CLIENT_PACKS}/${HOSTNAME}/" >/dev/null
+    zip --exclude \*.zip -rjD "${CLIENT_PACKS_DIR}/${HOST_NAME}.zip" "${CLIENT_PACKS_DIR}/${HOST_NAME}/" >/dev/null
     echo
-    echo -e "Host pack with clients configs created:\n${CLIENT_PACKS}/${HOSTNAME}.zip"
+    echo "Host pack with client configs created:${BR}${CLIENT_PACKS_DIR}/${HOST_NAME}.zip"
 }
 
 
-USAGE="Usage:
+find_client_names() {
+    # Return array of client names for specified host_name
+    local _var _res _host_name _filename
+    if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
+    _res=()
+    _host_name=$1
+    for _filename in "${CLIENT_PACKS_DIR}/${_host_name}/"*.{ovpn,conf}; do
+        _filename=${_filename##*/}
+        _filename=${_filename%.ovpn}
+        _filename=${_filename%.conf}
+        [[ "${_filename}" == '*' ]] && continue
+        _res+=("${_filename}")
+    done
+
+    if [[ ${_var} ]]; then eval "${_var}=(\${_res[@]})"; else echo "${_res[@]}"; fi
+}
+
+BR=$'\n'
+
+read -rd '' USAGE <<'EOF'
+Usage:
     openvpn-manage ACTION { PARAMS } [ OPTIONS ]
     ACTION := { usage | help | create | append | enable | disable | revoke | list | show }
-    OPTIONS := { -t CLIENT_TYPE | -s IP/CIDR | -c COUNT | -e | -d | -v }
+    OPTIONS := { -f CONF | -t CLIENT_TYPE | -s IP/CIDR | -c COUNT | -o CLIENT_OS | -e | -d | -v }
     CLIENT_TYPE := { user | router }
+    CLIENT_OS := { windows | nix }
 
-    openvpn-manage help [ ACTION ]
+    openvpn-manage { create | append } HOST_NAME [ OPTIONS ]
 
-    openvpn-manage { create host | append client[s] } HOSTNAME [ OPTIONS ]
+    openvpn-manage { enable | disable | revoke } { host HOST_NAME | client CLIENT_NAME }
 
-    openvpn-manage { enable | disable | revoke } { host HOSTNAME | client CLIENTNAME }
+    openvpn-manage list { host[s] | client[s] } [ HOST_NAME ] { -t CLIENT_TYPE | -s CLIENT_SUBNET_BEHIND | -e | -d }
 
-    openvpn-manage list { host[s] | client[s] } [ HOSTNAME ] { -t CLIENT_TYPE | -s CLIENT_SUBNET_BEHIND | -e | -d }
+    openvpn-manage show { host HOST_NAME | client CLIENT_NAME }
+EOF
 
-    openvpn-manage show { host HOSTNAME | client CLIENTNAME }"
-
-HELP=${USAGE}"
+read -rd '' HELP <<EOF
+${USAGE}
 
 Description:
-    \"host\" is the name of specific host (specific host can have several clients/certs).
-    \"client\" is specific vpn-client/cert for the host.
+    "host" is the name of specific host (specific host can have several clients/certs).
+    "client" is specific vpn-client/cert for the host.
 
 Actions:
-    create host HOSTNAME
-    append client HOSTNAME
-        Used for create/append clients to HOSTNAME.
+    create host HOST_NAME
+    append client HOST_NAME
+        Used for create/append clients to HOST_NAME.
         Difference is:
-        validation - you can't create host if HOSTNAME already exist and you can't
+        validation - you can't create host if HOST_NAME already exist and you can't
             append clients to non-existent host.
-        subnet applying for type router - for 'append' if -s not specified additional clients of
+        subnet applying for type router - for "append" if -s not specified additional clients of
             the host will have the same subnet as first available iroute option
             in first available client config.
 
     enable, disable, revoke
-        You can enable/disable/revoke specific client (client CLIENTNAME) or all clients
-        (host HOSTNAME) of the host.
+        You can enable/disable/revoke specific client (client CLIENT_NAME) or all clients
+        (host HOST_NAME) of the host.
         Enable and disable just delete/add 'disable' line to client config, so client can't
         connect. Host/client can be enabled/disabled any time.
         revoke adds client[s] cert[s] to revocation list, so it could be treated as
         persistent client deactivation.
         Note: revoked cert still can be unrevoked manually, but it's not supported
-        in this script yet.
+        by openvpn-manage.
 
     list
         List hosts or clients depends on filter options.
-        For HOSTNAME grep standard regexp's supported.
+        For HOST_NAME grep standard regexp's supported.
         Examples:
             List all hosts:
                 list hosts
             List all routers clients:
                 list clients -t router
             List enabled clients of specific host with specified internal subnet:
-                list clients HOSTNAME -e -s10.210.0.8/29
+                list clients HOST_NAME -e -s 10.10.0.8/29
 
 Options:
+    -f CONF
+        Configuration file of openvpn-manage
+        Default: /etc/openvpn/server/scripts/openvpn-manage.conf
+
     -t CLIENT_TYPE
-        Could be 'user' (default) or 'router'. Difference is client config options.
-        User config contain push \"route ...\" to the routers internal subnets.
+        Could be "user" (default) or "router". Difference is client config options.
+        User config contain push "route ..." to the routers internal subnets.
         Router config contain iroute to internal subnet behind it.
 
     -s CLIENT_SUBNET_BEHIND
-        Format: IP/CIDR. Subnet behind the router. Valid only if CLIENT_TYPE is 'router'.
+        Format: IP/CIDR. Subnet behind the router. Valid only if CLIENT_TYPE is "router".
         If no subnet specified subnet will be incremented from the last saved subnet.
         Subnet will be saved to LAST_IROUTE_SUBNET_FILE. If no file exist
         INITIAL_IROUTE_SUBNET will be used and then saved to LAST_IROUTE_SUBNET_FILE.
@@ -565,49 +563,115 @@ Options:
 
     -c COUNT
         Default is 1. Allow to create COUNT clients/certs for the host with single
-        command. Additional host clients/certs could be added via action 'append client'
+        command. Additional host clients/certs could be added via action "append"
         next time.
 
     -e, -d
         List enabled/disabled only.
 
     -v
-        Verbose output."
+        Verbose output.
+EOF
 
-# Some defaults
-DESCRIPTOR=/dev/null  # Default if no -v option specified
 
-# Parse positional arguments
+# Main case: Parse positional arguments
 case "$1" in
     ''|usage) quit 255 "${USAGE}"; ;;
+
     help) quit 255 "${HELP}"; ;;
-    *)
+
+    *)  # Parse args, verify, apply defaults.
+        # Really not for all actions root required, but to be sure...
+        # ((UID)) && quit 2 'Root privileges required'
+
         [[ $2 ]] || quit 1 "Action requires parameter!"
+        unset HELP USAGE
+
+        ## Defaults
+        DESCRIPTOR=/dev/null  # Default if no -v option specified
+        CONF='/etc/openvpn/server/scripts/openvpn-manage.conf'
+
+        # Options below can be overwrited in CONF file
+        CA_PASS=no  # 'yes' if CA is password protected
+        SERVER_DIR='/etc/openvpn/server'
+        KEYS_DIR="${SERVER_DIR}/keys"
+        CLIENT_KEYS_DIR="${SERVER_DIR}/client-keys"
+        CLIENT_PACKS_DIR="${SERVER_DIR}/client-packs"
+        CLIENT_CONFIG_DIR="${SERVER_DIR}/client-configs"
+        USERS_CONF="${SERVER_DIR}/users-config"
+        SERVER_CONF="${SERVER_DIR}/server.conf"  # If tcp and udp servers subnet are the same, any config is fine here
+        EASYRSA='/etc/openvpn/easy-rsa/easyrsa3'
+        CLIENT_OS_DEFAULT='nix'  # 'nix' for Unix-based OS, 'windows' for Windows
+        OPENVPN_USER=openvpn
+        OPENVPN_GROUP=openvpn
+        INITIAL_IROUTE_SUBNET='10.10.0.0/29'
+        LAST_IROUTE_SUBNET_FILE="${SERVER_DIR}/last_iroute_subnet"
+        HOST_NAME_ALLOWED_REGEX='^[A-Za-z0-9_-]+$'
+        ALLOW_DIFFERENT_CLIENT_TYPES_FOR_HOST=no
+        ## END Defaults
 
         ## Parse options
-        # Calculate first option position!
-        for i in $(seq 1 $#); do
+        # Calculate first option position
+        for ((i=1;i<=$#;++i)); do
             if [[ "${!i::1}" == '-' ]]; then
                 OPTIND=$i
                 break
             fi
         done
-        while getopts ":vedt:s:c:" OPT; do
+        while getopts ":vedt:o:s:c:f:" OPT; do
             [[ "${OPTARG::1}" = '-' ]] && quit 1 "Option argument can not start with '-'"
             case "$OPT" in
                 v) DESCRIPTOR=/dev/stdout; V='-v'; ;;
                 e) ENABLED=yes; E='-e'; ;;
                 d) ENABLED=no; D='-d'; ;;
                 t) CLIENT_TYPE=${OPTARG}; T='-t'; ;;
+                o) CLIENT_OS=${OPTARG}; O='-o';
+                    case "${CLIENT_OS}" in
+                        linux|mac|bsd) CLIENT_OS=nix; ;;
+                        windows|nix) ;;
+                        *) quit 1 "Invalid OS: ${CLIENT_OS}${BR}"'Have to be "windows" or "nix" (for Linux/Mac/BSD/etc). "linux", "mac", "bsd" translated to "nix".'
+                    esac
+                    ;;
                 s) CLIENT_SUBNET_BEHIND=${OPTARG}; S='-s';
                     validate_ip4cidr "${CLIENT_SUBNET_BEHIND}" || quit 1 "Invalid subnet: ${CLIENT_SUBNET_BEHIND}"
                     ;;
                 c) COUNT=${OPTARG}; C='-c'; ;;
+                f) CONF=${OPTARG}; F='-f'; ;;
                 :) quit 1 "Option -$OPTARG requires an argument"; ;;
                 *) quit 1 "Invalid option: -$OPTARG"; ;;
             esac
         done
         # OPTIND=1
+
+        # Import configuration file
+        . "${CONF}"
+        (($?)) && quit 1 "Failed to import configuration file: ${CONF}"
+        # echo "${CLIENT_CONFIG_TEMPLATE}" >&2
+
+        CHROOT=$(exec -c grep -m1 '^chroot ' "${SERVER_CONF}")
+        CHROOT=${CHROOT#chroot }
+        if [[ -n "${CHROOT}" && "${CHROOT}" != '/' ]]; then
+            USERS_CONF_IN_CHROOT=${USERS_CONF##*/}  # E.g. users-config
+        else
+            USERS_CONF_IN_CHROOT=${USERS_CONF}
+        fi
+
+        # Verification of config options
+        [[ -d "${CHROOT}" ]] || quit 1 "Chroot server dir have to exist for current configuration: ${CHROOT}"
+        [[ -d "${SERVER_DIR}" ]] || quit 1 "Server dir does not exist: ${SERVER_DIR}"
+        [[ -d "${KEYS_DIR}" ]] || quit 1 "Keys dir does not exist: ${KEYS_DIR}"
+        [[ -d "${CLIENT_KEYS_DIR}" ]] || quit 1 "Clients keys dir does not exist: ${CLIENT_KEYS_DIR}"
+        [[ -d "${CLIENT_PACKS_DIR}" ]] || quit 1 "Clients packages dir dir does not exist: ${CLIENT_PACKS_DIR}"
+        [[ -d "${CLIENT_CONFIG_DIR}" ]] || quit 1 "Clients config dir dir does not exist: ${CLIENT_CONFIG_DIR}"
+        [[ -f "${USERS_CONF}" ]] || quit 1 "Users shared config file does not exist: ${USERS_CONF}"
+        [[ -f "${SERVER_CONF}" ]] || quit 1 "OpenVPN server config file does not exist: ${SERVER_CONF}"
+        [[ -d "${EASYRSA}" ]] || quit 1 "EASYRSA dir does not exist: ${EASYRSA}"
+        [[ -f "${EASYRSA}/pki/crl.pem" ]] || quit 1 "Certificate revocation list file does not exist: ${EASYRSA}/pki/crl.pem"
+        getent passwd "${OPENVPN_USER}" &>/dev/null || quit 1 "No such user: ${OPENVPN_USER}"
+        getent group "${OPENVPN_GROUP}" &>/dev/null || quit 1 "No such group: ${OPENVPN_GROUP}"
+
+
+        [[ -z ${CLIENT_OS} ]] && CLIENT_OS=${CLIENT_OS_DEFAULT}
 
         if [[ -n $E && -n $D ]]; then
             quit 1 "Options -e and -d can not be specified simultaneously!"
@@ -620,152 +684,151 @@ case "$1" in
         esac
 
         if [[ -n "${S}" && "${CLIENT_TYPE}" != router ]]; then
-            quit 1 "Subnet can be specified for type 'router' only"
+            quit 1 "Subnet can be specified for type \"router\" only"
         fi
 
         case "${COUNT}" in
             '') COUNT=1; ;;
-            *[!0-9]*) quit 1 "Invalid COUNT: ${COUNT}"; ;;
+            *[^0-9]*) quit 1 "Invalid COUNT: ${COUNT}"; ;;
         esac
-
-        # echo -e "OPTARG:${OPTARG}\nOPTERR:${OPTERR}\nOPTIND:${OPTIND}\nOPT:${OPT}\nCLIENT_TYPE:${CLIENT_TYPE}\nCLIENT_SUBNET_BEHIND:${CLIENT_SUBNET_BEHIND}\nCOUNT:${COUNT}" >&2
         ;;&
+
     create)
-        HOSTNAME=$3
-        [[ "$2" == host ]] || quit 1 "Invalid parameter: $2"
-        [[ ${HOSTNAME} ]] || quit 1 "You must specify HOSTNAME!"
-        validate_host_name "${HOSTNAME}"
-        if [[ -d "${CLIENT_PACKS}/${HOSTNAME}" ]]; then
-            quit 1 "Host already exist: ${HOSTNAME}\nUse 'append client' to append clients to the host."
+        HOST_NAME=$2
+        [[ ${HOST_NAME} ]] || quit 1 "You have to specify HOST_NAME"
+        validate_host_name "${HOST_NAME}"
+        if [[ -d "${CLIENT_PACKS_DIR}/${HOST_NAME}" ]]; then
+            quit 1 "Host already exist: ${HOST_NAME}${BR}Use \"append\" to append clients to existing host."
         fi
         ;;&
+
     append)
-        HOSTNAME=$3
-        [[ "$2" =~ clients* ]] || quit 1 "Invalid parameter: $2"
-        [[ ${HOSTNAME} ]] || quit 1 "You must specify HOSTNAME!"
-        validate_host_name "${HOSTNAME}"
-        if ! [[ -d "${CLIENT_PACKS}/${HOSTNAME}" ]]; then
-            quit 1 "Host does not exist: ${HOSTNAME}\nUse 'create host' to create new host."
+        HOST_NAME=$2
+        [[ ${HOST_NAME} ]] || quit 1 "You have to specify HOST_NAME"
+        validate_host_name "${HOST_NAME}"
+        if ! [[ -d "${CLIENT_PACKS_DIR}/${HOST_NAME}" ]]; then
+            quit 1 "Host does not exist: ${HOST_NAME}${BR}Use 'create' to create new host."
         fi
 
-        if grep -q '^iroute ' "$(ls -1 "${CLIENT_CONFIGS}"/*-"${HOSTNAME}" | head -1)"; then
+        for i in "${CLIENT_CONFIG_DIR}"/*-"${HOST_NAME}"; do FIRST_CLIENT_CONFIG_FILE=$i; break; done
+        if grep -q '^iroute ' "${FIRST_CLIENT_CONFIG_FILE}"; then
             # Use the same client type as other clients has
             CLIENT_TYPE_PREVIOUS=router
         else
             CLIENT_TYPE_PREVIOUS=user
         fi
         if [[ "${CLIENT_TYPE_PREVIOUS}" != "${CLIENT_TYPE}" ]]; then
-            if [[ "${ALLOW_DIFFERENT_CLIENT_TYPES4HOST}" == yes ]]; then
+            if [[ "${ALLOW_DIFFERENT_CLIENT_TYPES_FOR_HOST}" == yes ]]; then
                 if [[ ${T} ]]; then  # Specified in command line explicitly
-                    [[ ${V} ]] && echo "Warning! Client type specified in command line doesn't match the type of previous clients!" &>${DESCRIPTOR}
+                    [[ ${V} ]] && echo "Warning: Client type specified in command line doesn't match the type of previous clients for this host!" &>"${DESCRIPTOR}"
                 else
                     CLIENT_TYPE=${CLIENT_TYPE_PREVIOUS}
                 fi
             else
-                [[ $T ]] && quit 1 "Client type specified in command line doesn't match the type of previous clients!\nRemove it or specify proper type."
+                [[ $T ]] && quit 1 "Client type specified in command line doesn't match the type of previous clients for this host!${BR}Remove it or specify proper type."
                 CLIENT_TYPE=${CLIENT_TYPE_PREVIOUS}
             fi
         fi
         if [[ "${CLIENT_TYPE}" == router && -z "${S}" ]]; then
-            populate_subnet_var "${HOSTNAME}"
+            populate_subnet_var "${HOST_NAME}"
+        fi
+
+        # Reuse previous CLIENT_OS if commandline option '-o' ommited
+        for i in "${CLIENT_PACKS_DIR}/${HOST_NAME}/"*[np][fn]; do FIRST_EXT=${i##*.}; break; done
+        if [[ -z "$O" ]]; then
+            if [[ "${FIRST_EXT}" == 'ovpn' ]]; then
+                CLIENT_OS=windows
+            else
+                CLIENT_OS=nix
+            fi
         fi
         ;;&
+
     create|append)
-        create_host "${HOSTNAME}" "${COUNT}"
+        [[ -z ${CLIENT_CONFIG_TEMPLATE} ]] && quit 1 'CLIENT_CONFIG_TEMPLATE variable required, you have to set it in configuration file.'
+        create_host "${HOST_NAME}" "${COUNT}"
         ;;
 
     enable|disable|revoke|update|show)
         case "$2" in
             client)
-                CLIENTNAME=$3
-                [[ ${CLIENTNAME} ]] || quit 1 "You must specify CLIENTNAME!"
-                validate_client_name "${CLIENTNAME}"
-                if ! [[ -f "${CLIENT_CONFIGS}/${CLIENTNAME}" ]]; then
-                    quit 1 "No such client or client config is absent: ${CLIENTNAME}"
+                CLIENT_NAME=$3
+                [[ ${CLIENT_NAME} ]] || quit 1 "You have to specify CLIENT_NAME"
+                validate_client_name "${CLIENT_NAME}"
+                if ! [[ -f "${CLIENT_CONFIG_DIR}/${CLIENT_NAME}" ]]; then
+                    quit 1 "No such client or client config is absent: ${CLIENT_NAME}"
                 fi
                 ;;
             host)
-                HOSTNAME=$3
-                [[ ${HOSTNAME} ]] || quit 1 "You must specify HOSTNAME!"
-                validate_host_name "${HOSTNAME}"
-                if ! [[ -d "${CLIENT_PACKS}/${HOSTNAME}" ]]; then
-                    quit 1 "No such host: ${HOSTNAME}"
+                HOST_NAME=$3
+                [[ ${HOST_NAME} ]] || quit 1 "You have to specify HOST_NAME"
+                validate_host_name "${HOST_NAME}"
+                if ! [[ -d "${CLIENT_PACKS_DIR}/${HOST_NAME}" ]]; then
+                    quit 1 "No such host: ${HOST_NAME}"
                 fi
                 ;;
-            *) quit 1 "Invalid parameter: $2"; ;;
+            *) quit 1 "Invalid parameter: $2"
         esac
         ;;&
+
     enable)
         case "$2" in
             client)
-                enable_client "${CLIENTNAME}"
+                enable_client "${CLIENT_NAME}"
                 ;;
             host)
-                for cn in $(ls -1 "${CLIENT_PACKS}/${HOSTNAME}" | \
-                        grep -e '\.ovpn$' -e '\.conf$' | \
-                        sed -e 's/\.ovpn$//g' -e 's/\.conf$//g' | sort -u); do
-                    enable_client "${cn}"
-                done
-                echo
-                echo "All clients of ${HOSTNAME} was enabled"
+                find_client_names -v client_names "${HOST_NAME}"
+                for cn in "${client_names[@]}"; do enable_client "${cn}"; done
+                echo "${BR}All clients of ${HOST_NAME} was enabled"
                 ;;
         esac
         ;;
+
     disable)
         case "$2" in
             client)
-                disable_client "${CLIENTNAME}"
+                disable_client "${CLIENT_NAME}"
                 ;;
             host)
-                for cn in $(ls -1 "${CLIENT_PACKS}/${HOSTNAME}" | \
-                        grep -e '\.ovpn$' -e '\.conf$' | \
-                        sed -e 's/\.ovpn$//g' -e 's/\.conf$//g' | sort -u); do
-                    disable_client "${cn}"
-                done
-                echo
-                echo "All clients of ${HOSTNAME} was disabled"
+                find_client_names -v client_names "${HOST_NAME}"
+                for cn in "${client_names[@]}"; do disable_client "${cn}"; done
+                echo "${BR}All clients of ${HOST_NAME} was disabled"
                 ;;
         esac
         ;;
+
     revoke)
         cd "${EASYRSA}"
         case "$2" in
             client)
-                revoke_cert "${CLIENTNAME}"
+                revoke_cert "${CLIENT_NAME}"
                 ;;
             host)
-                for cn in $(ls -1 "${CLIENT_PACKS}/${HOSTNAME}" | \
-                        grep -e '\.ovpn$' -e '\.conf$' | \
-                        sed -e 's/\.ovpn$//g' -e 's/\.conf$//g' | sort -u); do
-                    revoke_cert "${cn}"
-                done
-                echo
-                echo "All certs of ${HOSTNAME} was revoked"
+                find_client_names -v client_names "${HOST_NAME}"
+                for cn in "${client_names[@]}"; do revoke_cert "${cn}"; done
+                echo "${BR}All certs of ${HOST_NAME} was revoked"
                 ;;
         esac
-        ./easyrsa --batch gen-crl &>${DESCRIPTOR} && echo "Revocation list was updated" \
+        ./easyrsa --batch gen-crl &>"${DESCRIPTOR}" && echo "Revocation list was updated" \
                                                 || quit 1 "Failed to update revocation list!"
-        chown :${GRP} "${EASYRSA}/pki/crl.pem"
+        chown :"${OPENVPN_GROUP}" "${EASYRSA}/pki/crl.pem"
         chmod 440 "${EASYRSA}/pki/crl.pem"
-        # chown :${GRP} "${EASYRSA}/pki/index.txt"
+        # chown :${OPENVPN_GROUP} "${EASYRSA}/pki/index.txt"
         # chmod 640 "${EASYRSA}/pki/index.txt"
         # chmod g+x "${EASYRSA}/pki"
         cd - >/dev/null
         ;;
+
     update)  # Update type and/or subnet
         case "$2" in
             client)
-                update_client "${CLIENTNAME}"
+                update_client "${CLIENT_NAME}"
                 ;;
             host)
                 # quit 254 "Update all host clients feature does not implemented yet. Use it with single client."
-                for cn in $(ls -1 "${CLIENT_PACKS}/${HOSTNAME}" | \
-                        grep -e '\.ovpn$' -e '\.conf$' | \
-                        sed -e 's/\.ovpn$//g' -e 's/\.conf$//g' | sort -u); do
-                    update_client "${cn}"
-                done
-                echo
-                echo "All clients of ${HOSTNAME} was updated"
+                find_client_names -v client_names "${HOST_NAME}"
+                for cn in "${client_names[@]}"; do update_client "${cn}"; done
+                echo "${BR}All clients of ${HOST_NAME} was updated"
                 ;;
         esac
         ;;
@@ -773,18 +836,18 @@ case "$1" in
     list)  # TODO: finish
         case "$2" in
             clients|client)
-                OUT=$(ls -1 "${CLIENT_CONFIGS}" | grep -v '^DEFAULT$')  # All clients/certs
+                OUT=$(ls -1 "${CLIENT_CONFIG_DIR}" | grep -v '^DEFAULT$')  # All clients/certs
                 if [[ -z $3 ]]; then
                     [[ ${OUT} ]] && echo "${OUT}" || quit 1 "No clients match!"
                     exit 0
                 elif [[ "${3::1}" != '-' ]]; then
-                    # Filter by HOSTNAME
-                    HOSTNAME=$3
-                    OUT=$(grep "^[[:digit:]]*-${HOSTNAME}$" <<<"${OUT}")
+                    # Filter by HOST_NAME
+                    HOST_NAME=$3
+                    OUT=$(exec -c grep "^[[:digit:]]*-${HOST_NAME}$" <<<"${OUT}")
                     [[ ${OUT} ]] || quit 1 "No clients match!"
-                    # [[ -d "${CLIENT_PACKS}/${HOSTNAME}" ]] || quit 1 "No such host: ${HOSTNAME}"
-                    # ls -1 "${CLIENT_CONFIGS}" | grep "^[[:digit:]]*-${HOSTNAME}$"
-                    # find "${CLIENT_CONFIGS}" -maxdepth 1 -mindepth 1 -type f -name "[0-9]+-$3" -printf "%f\n"  | awk -F / '{print $NF}' | cut -d- -f2- | sort -u
+                    # [[ -d "${CLIENT_PACKS_DIR}/${HOST_NAME}" ]] || quit 1 "No such host: ${HOST_NAME}"
+                    # ls -1 "${CLIENT_CONFIG_DIR}" | grep "^[[:digit:]]*-${HOST_NAME}$"
+                    # find "${CLIENT_CONFIG_DIR}" -maxdepth 1 -mindepth 1 -type f -name "[0-9]+-$3" -printf "%f\n"  | awk -F / '{print $NF}' | cut -d- -f2- | sort -u
                 fi
 
                 # Filter by options
@@ -792,44 +855,47 @@ case "$1" in
                     case "${CLIENT_TYPE}" in
                         router)
                             OUT=$(while read client; do
-                                    grep -q '^iroute ' "${CLIENT_CONFIGS}/${client}" && echo "${client}";
+                                    grep -q '^iroute ' "${CLIENT_CONFIG_DIR}/${client}" && echo "${client}";
                                 done <<<"${OUT}")
                             ;;
                         user)
                             OUT=$(while read client; do
-                                    grep -q '^iroute ' "${CLIENT_CONFIGS}/${client}" || echo "${client}";
+                                    grep -q '^iroute ' "${CLIENT_CONFIG_DIR}/${client}" || echo "${client}";
                                 done <<<"${OUT}")
                             ;;
                     esac
                 fi
                 if [[ $D ]]; then
                     OUT=$(while read client; do
-                            grep -q '^disable$' "${CLIENT_CONFIGS}/${client}" && echo "${client}";
+                            grep -q '^disable$' "${CLIENT_CONFIG_DIR}/${client}" && echo "${client}";
                         done <<<"${OUT}")
                 elif [[ $E ]]; then
                     OUT=$(while read client; do
-                            grep -q '^disable$' "${CLIENT_CONFIGS}/${client}" || echo "${client}";
+                            grep -q '^disable$' "${CLIENT_CONFIG_DIR}/${client}" || echo "${client}";
                         done <<<"${OUT}")
                 fi
                 if [[ $S ]]; then
-                    IP=$(cut -d/ -f1 <<<"${CLIENT_SUBNET_BEHIND}")
-                    MASK=$(cidr2mask $(cut -d/ -f2 <<<"${CLIENT_SUBNET_BEHIND}"))
+                    IP=${CLIENT_SUBNET_BEHIND%%/*}
+                    cidr2mask -v MASK ${CLIENT_SUBNET_BEHIND#*/}
                     OUT=$(while read client; do
-                            grep -q "^iroute $IP $MASK" "${CLIENT_CONFIGS}/${client}" && echo "${client}";
+                            grep -q "^iroute ${IP} ${MASK}" "${CLIENT_CONFIG_DIR}/${client}" && echo "${client}";
                         done <<<"${OUT}")
                 fi
+                # if [[ $O ]]; then
+                #     # Can be manually changed by user, so skip implementing this filter.
+                # fi
 
                 [[ ${OUT} ]] && echo "${OUT}" || quit 1 "No clients match!"
                 ;;
             hosts|host)
-                OUT=$(ls -1 "${CLIENT_CONFIGS}" | grep -v '^DEFAULT$' | cut -d- -f2- | sort -u)  # All hosts
+                OUT=$(ls -1 "${CLIENT_CONFIG_DIR}" | grep -v '^DEFAULT$' | cut -d- -f2- | sort -u)  # All hosts
                 if [[ -z $3 ]]; then
                     [[ ${OUT} ]] && echo "${OUT}" || quit 1 "No hosts match!"
                     exit 0
                 elif [[ "${3::1}" != '-' ]]; then
-                    # Filter by HOSTNAME
-                    HOSTNAME=$3
-                    OUT=$(grep "^${HOSTNAME}$" <<<"${OUT}")
+                    # Filter by HOST_NAME
+                    HOST_NAME=$3
+                    OUT=$(exec -c grep "^${HOST_NAME}$" <<<"${OUT}")
                     [[ ${OUT} ]] || quit 1 "No hosts match!"
                 fi
 
@@ -837,58 +903,53 @@ case "$1" in
                 if [[ $T ]]; then
                     case "${CLIENT_TYPE}" in
                         router)
-                            OUT=$(while read HOSTNAME; do
-                                    grep -q '^iroute ' "$(ls -1 "${CLIENT_CONFIGS}"/*-"${HOSTNAME}" | head -1)" \
-                                    && echo "${HOSTNAME}";
+                            OUT=$(while read HOST_NAME; do
+                                    grep -q '^iroute ' "$(ls -1 "${CLIENT_CONFIG_DIR}"/*-"${HOST_NAME}" | head -1)" \
+                                    && echo "${HOST_NAME}";
                                 done <<<"${OUT}")
                             ;;
                         user)
-                            OUT=$(while read HOSTNAME; do
-                                    grep -q '^iroute ' "$(ls -1 "${CLIENT_CONFIGS}"/*-"${HOSTNAME}" | head -1)" \
-                                    || echo "${HOSTNAME}";
+                            OUT=$(while read HOST_NAME; do
+                                    grep -q '^iroute ' "$(ls -1 "${CLIENT_CONFIG_DIR}"/*-"${HOST_NAME}" | head -1)" \
+                                    || echo "${HOST_NAME}";
                                 done <<<"${OUT}")
                             ;;
                     esac
                 fi
                 if [[ $D ]]; then
                     # The host treated as disabled if all its clients disabled
-                    quit 254 "-d filter for hosts does not implemented yet :("
-                    # OUT=$(while read HOSTNAME; do
-                    #         grep -q '^disable$' "${CLIENT_CONFIGS}/${client}" && echo "${HOSTNAME}";
+                    quit 254 "-d filter for hosts is not implemented yet"
+                    # OUT=$(while read HOST_NAME; do
+                    #         grep -q '^disable$' "${CLIENT_CONFIG_DIR}/${client}" && echo "${HOST_NAME}";
                     #     done <<<"${OUT}")
                 elif [[ $E ]]; then
                     # The host treated as enabled if at least one of its clients enabled
-                    quit 254 "-e filter for hosts does not implemented yet :("
+                    quit 254 "-e filter for hosts is not implemented yet"
                 fi
                 if [[ $S ]]; then
-                    quit 254 "-s filter for hosts does not implemented yet :("
-                    IP=$(cut -d/ -f1 <<<"${CLIENT_SUBNET_BEHIND}")
-                    MASK=$(cidr2mask $(cut -d/ -f2 <<<"${CLIENT_SUBNET_BEHIND}"))
+                    quit 254 "-s filter for hosts is not implemented yet"
                 fi
 
                 [[ ${OUT} ]] && echo "${OUT}" || quit 1 "No hosts match!"
                 ;;
-            *) quit 1 "Invalid parameter: $2"; ;;
+            *) quit 1 "Invalid parameter: $2"
         esac
         ;;
+
     show)
         case "$2" in
             client)
-                show_client "${CLIENTNAME}"
+                show_client "${CLIENT_NAME}"
                 ;;
             host)
-                # quit 254 "Show host feature does not implemented yet. Use it with single client."
-                for cn in $(ls -1 "${CLIENT_PACKS}/${HOSTNAME}" | \
-                        grep -e '\.ovpn$' -e '\.conf$' | \
-                        sed -e 's/\.ovpn$//g' -e 's/\.conf$//g' | sort -u); do
-                    show_client "${cn}"
-                    echo
-                done
+                find_client_names -v client_names "${HOST_NAME}"
+                for cn in "${client_names[@]}"; do show_client "${cn}"; echo; done
                 ;;
         esac
         ;;
-    *)                                                                                                                                                                                        COW='\nBut don'$'\'''t be upset! Pet the croco and go ahead to eat some cookies!\n'; KOTEHOK=$'\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x5f\x5f\x2e\x2e\x2d\x2d\x27\x27\x60\x60\x2d\x2d\x2d\x2e\x2e\x2e\x2e\x5f\x5f\x5f\x20\x20\x20\x5f\x2e\x2e\x2e\x5f\x20\x20\x20\x20\x5f\x5f\x0a\x2f\x2f\x2f\x20\x2f\x2f\x5f\x2e\x2d\x27\x20\x20\x20\x20\x2e\x2d\x2f\x22\x3b\x20\x20\x60\x20\x20\x20\x20\x20\x20\x20\x20\x60\x60\x3c\x2e\x5f\x20\x20\x60\x60\x2e\x27\x27\x5f\x20\x60\x2e\x20\x2f\x20\x2f\x2f\x20\x2f\x0a\x2f\x2f\x2f\x5f\x2e\x2d\x27\x20\x5f\x2e\x2e\x2d\x2d\x2e\x27\x5f\x20\x20\x20\x20\x5c\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x60\x28\x20\x29\x20\x29\x20\x2f\x2f\x20\x2f\x2f\x0a\x2f\x20\x28\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x20\x28\x3c\x20\x5f\x20\x20\x20\x20\x20\x3b\x5f\x2e\x2e\x5f\x5f\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x3b\x20\x60\x27\x20\x2f\x20\x2f\x2f\x2f\x0a\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x20\x60\x2d\x2e\x5f\x2c\x5f\x29\x27\x20\x2f\x2f\x20\x2f\x20\x60\x60\x2d\x2d\x2e\x2e\x2e\x5f\x5f\x5f\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x2f\x20\x2f\x20\x2f\x2f\x27\x0a'; HEKOTEHOK=$'\x20\x20\x20\x20\x20\x20\x5f\x3d\x2c\x5f\x0a\x20\x20\x20\x6f\x5f\x2f\x36\x20\x2f\x23\x20\x20\x20\x5c\x5f\x5f\x20\x7c\x23\x23\x2f\x0a\x20\x20\x20\x20\x3d\x27\x7c\x2d\x2d\x20\x20\x20\x20\x20\x20\x2f\x20\x20\x20\x23\x27\x2d\x2e\x0a\x20\x20\x20\x20\x20\x20\x5c\x23\x7c\x5f\x20\x20\x20\x5f\x27\x2d\x2e\x20\x2f\x0a\x20\x20\x20\x20\x20\x20\x20\x7c\x2f\x20\x5c\x5f\x28\x20\x23\x20\x7c\x22\x0a\x20\x20\x20\x20\x20\x20\x43\x2f\x20\x2c\x2d\x2d\x5f\x5f\x5f\x2f\x0a'; if [[ $((1$(date +%N)%2)) -eq 0 ]]; then COW+=${KOTEHOK}; else COW+=${HEKOTEHOK}; fi
-        quit 1 "This action does not implemented yet.\n${COW}"
+
+    *)                                                                                                                                                                                                                 EE=${BR}${BR}'But don'$'\'''t be upset! Pet the croco and go ahead to eat some cookies!'$'\n'; KOTEHOK=$'\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x5f\x5f\x2e\x2e\x2d\x2d\x27\x27\x60\x60\x2d\x2d\x2d\x2e\x2e\x2e\x2e\x5f\x5f\x5f\x20\x20\x20\x5f\x2e\x2e\x2e\x5f\x20\x20\x20\x20\x5f\x5f\x0a\x2f\x2f\x2f\x20\x2f\x2f\x5f\x2e\x2d\x27\x20\x20\x20\x20\x2e\x2d\x2f\x22\x3b\x20\x20\x60\x20\x20\x20\x20\x20\x20\x20\x20\x60\x60\x3c\x2e\x5f\x20\x20\x60\x60\x2e\x27\x27\x5f\x20\x60\x2e\x20\x2f\x20\x2f\x2f\x20\x2f\x0a\x2f\x2f\x2f\x5f\x2e\x2d\x27\x20\x5f\x2e\x2e\x2d\x2d\x2e\x27\x5f\x20\x20\x20\x20\x5c\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x60\x28\x20\x29\x20\x29\x20\x2f\x2f\x20\x2f\x2f\x0a\x2f\x20\x28\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x20\x28\x3c\x20\x5f\x20\x20\x20\x20\x20\x3b\x5f\x2e\x2e\x5f\x5f\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x3b\x20\x60\x27\x20\x2f\x20\x2f\x2f\x2f\x0a\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x20\x60\x2d\x2e\x5f\x2c\x5f\x29\x27\x20\x2f\x2f\x20\x2f\x20\x60\x60\x2d\x2d\x2e\x2e\x2e\x5f\x5f\x5f\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x2f\x20\x2f\x20\x2f\x2f\x27\x0a'; HEKOTEHOK=$'\x20\x20\x20\x20\x20\x20\x5f\x3d\x2c\x5f\x0a\x20\x20\x20\x6f\x5f\x2f\x36\x20\x2f\x23\x20\x20\x20\x5c\x5f\x5f\x20\x7c\x23\x23\x2f\x0a\x20\x20\x20\x20\x3d\x27\x7c\x2d\x2d\x20\x20\x20\x20\x20\x20\x2f\x20\x20\x20\x23\x27\x2d\x2e\x0a\x20\x20\x20\x20\x20\x20\x5c\x23\x7c\x5f\x20\x20\x20\x5f\x27\x2d\x2e\x20\x2f\x0a\x20\x20\x20\x20\x20\x20\x20\x7c\x2f\x20\x5c\x5f\x28\x20\x23\x20\x7c\x22\x0a\x20\x20\x20\x20\x20\x20\x43\x2f\x20\x2c\x2d\x2d\x5f\x5f\x5f\x2f\x0a'; if ((1$(exec -c date +%N)%2)); then EE+=${KOTEHOK}; else EE+=${HEKOTEHOK}; fi  # Easter egg =)
+        quit 1 "This action is not implemented yet.${EE}"
         ;;
 esac
 
