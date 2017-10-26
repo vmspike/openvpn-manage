@@ -402,6 +402,7 @@ add_client() {
     # Write client config
     eval "read -rd '' CLIENT_CONFIG <<EOF${BR}${CLIENT_CONFIG_TEMPLATE}${BR}EOF"
     echo "${CLIENT_CONFIG}" >"${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
+    chmod 640 "${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
     # (set -o posix; set) >&2
 
     # .zip pack beside all-in-one config
