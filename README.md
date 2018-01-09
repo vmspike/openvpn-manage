@@ -1,6 +1,8 @@
 # openvpn-manage
 
-`openvpn-server-setup` designed to help OpenVPN server setup on `CentOS 6`, `CentOS 7` or `Ubuntu Xenial 16.04`.
+`openvpn-server-setup` designed to setup OpenVPN server on single run.
+
+Supported OS: `CentOS 6`, `CentOS 7`, `Ubuntu Xenial 16.04`
 
 It can be used for stock openvpn server configuration.
 
