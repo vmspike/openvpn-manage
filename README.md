@@ -9,7 +9,7 @@ Finally it setup dual TCP/UDP openvpn server running in chroot environment.
 You can put `openvpn-server-setup` to remote host and run it:
 ```bash
 wget https://github.com/vmspike/openvpn-manage/raw/master/openvpn-server-setup
-sudo bash ./openvpn-server-setu
+sudo bash ./openvpn-server-setup
 ```
 
 Options `mssfix` (default) or `link-mtu` can be specified to automatically set confguration type during setup:

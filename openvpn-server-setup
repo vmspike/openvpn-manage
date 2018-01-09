@@ -109,11 +109,15 @@ if [[ -f /etc/redhat-release ]]; then
     (($?==0)) || quit 1 'Failed to install epel repo'
 elif [[ -f /etc/debian_version ]]; then
     OS_family=Debian
-    if ! grep -q ' xenial ' /etc/apt/sources.list; then
-        quit 1 'Only Ubuntu Xenial 16.04 supported for Debian family, check your OS version in /etc/apt/sources.list'
+    if grep -q ' xenial ' /etc/apt/sources.list; then
+        OS=Ubuntu
+        OS_release=Xenial
+    # elif grep -q ' stretch ' /etc/apt/sources.list; then
+    #     OS=Debian
+    #     OS_release=Stretch
+    else
+        quit 1 'Only Ubuntu Xenial 16.04 supported for Debian family'
     fi
-    OS=Ubuntu
-    OS_release=Xenial
 else
     quit 1 'Unsupported OS family'
 fi
@@ -126,9 +130,11 @@ case "${OS_family}" in
         (($?==0)) || quit 1 'Failed to install required packages'
         ;;
     Debian)
-        echo 'Add official openvpn repo'  # See https://community.openvpn.net/openvpn/wiki/OpenvpnSoftwareRepos
-        wget -nv -O - https://swupdate.openvpn.net/repos/repo-public.gpg | apt-key add -
-        echo "deb http://build.openvpn.net/debian/openvpn/stable ${OS_release,,} main" >/etc/apt/sources.list.d/openvpn-aptrepo.list
+        if [[ "${OS_release}" != Stretch ]]; then
+            echo 'Add official openvpn repo'  # See https://community.openvpn.net/openvpn/wiki/OpenvpnSoftwareRepos
+            wget -nv -O - https://swupdate.openvpn.net/repos/repo-public.gpg | apt-key add -
+            echo "deb http://build.openvpn.net/debian/openvpn/stable ${OS_release,,} main" >/etc/apt/sources.list.d/openvpn-aptrepo.list
+        fi
         echo 'Updating packages list'
         apt-get -yqq update
         echo 'Installing required packages'
@@ -1779,9 +1785,9 @@ echo 'Evaluate iptables rules and save'
 # Evaluate
 eval "${IPTABLES_RULES}"
 # Save
-if [[ "${OS}" == 'CentOS' ]]; then
+if [[ "${OS_family}" == 'RedHat' ]]; then
     service iptables save
-elif [[ "${OS}" == 'Ubuntu' ]]; then
+else
     netfilter-persistent save
     netfilter-persistent reload
 fi
