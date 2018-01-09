@@ -1,11 +1,281 @@
 #!/bin/bash
 
 ##
+# openvpn-server-setup designed to help OpenVPN server setup on CentOS 6/7 or
+# Ubuntu Xenial 16.04.
+# It can be used for stock openvpn server configuration.
+# For customizations you still need manually tune configuration.
+#
+# You can execute this script on remote host via ssh:
+#   ssh user@host 'sudo bash -s' -- <'/local/path/to/openvpn-server-setup'
+# Or copy to remote host and run:
+#   sudo bash /path/to/openvpn-server-setup [--mssfix | --link-mtu]
+# Option mssfix or link-mtu (default) is used to specify confguration type:
+#   mssfix generally more stable but less resistant to openvpn connection tracking by web sites.
+# You can change behavoir after creation by modifying server and client
+# configs (comment/uncomment corresponding lines).
+#
+# openvpn-manage configuration tool embedded to this script and will be available after setup.
+# It helps you to manage openvpn users.
+##
+
+
+## Defaults
+SERVER_LOCAL_IF='eth0'
+link_mtu=';link-mtu'
+mssfix='mssfix'
+
+
+##
 # Exit with optional message to stderr
 ##
 quit() {
     [[ $2 ]] && echo "$2" >&2
-    exit "$1"
+    exit "${1:-0}"
+}
+
+
+##
+# Validate IPv4 address
+# Note: this is invalid address: 192.168.000.001
+##
+validate_ip4() {
+    local _re
+    _re='^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$'
+    [[ "$1" =~ ${_re} ]] && return 0 || return 1
+}
+
+
+((UID)) && quit 1 "You are not root. Try: sudo $0 $*"
+BR=$'\n'  # Newline alias
+
+
+## Decide which way preferred: mssfix or link-mtu
+if [[ ${1::1} == '-' ]]; then  # First arg is an option
+    opt=${1#${1%%[^-]*}}  # Remove leading hyphens
+    if [[ "${opt}" == 'mssfix' ]]; then
+        link_mtu=';link-mtu'
+        mssfix='mssfix'
+    elif [[ "${opt}" == 'link-mtu' ]]; then
+        link_mtu='link-mtu'
+        mssfix=';mssfix'
+    else
+        quit 1 "Invalid option: $1"
+    fi
+fi
+
+## Check OS
+if [[ -f /etc/redhat-release ]]; then
+    OS_family=RedHat
+
+    ## Get CentOS major version
+    CentOS_major=$(exec -c sed -n 's/.* \([0-9]\+\)\.\?.*/\1/p' /etc/redhat-release)
+
+    if ! ((CentOS_major == 6 || CentOS_major == 7)); then
+        quit 1 'Only CentOS 6 & 7 supported for RedHat family, check your CentOS version in /etc/redhat-release'
+    fi
+    echo "CentOS major version detected: ${CentOS_major}"
+
+    OS=CentOS
+
+    ## You could want to upgrade the system to latest state if it's created from scratch
+    # yum -y -d0 upgrade
+
+    case "${CentOS_major}" in
+        7)
+            echo 'Adding epel repo'
+            rpm -ivh --replacepkgs "http://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm"
+            (($?==0)) || quit 1 'Failed to add epel repo'
+
+            echo 'Disable and stop firewalld if exists'
+            systemctl disable firewalld
+            systemctl stop firewalld
+            echo 'Install, start and enable iptables-services'
+            yum -y -d0 install iptables-services
+            systemctl enable iptables
+            systemctl start iptables
+            ;;
+        6)
+            echo 'Fix ancient ca-certs'
+            yum --disablerepo=epel -y -d1 update ca-certificates
+
+            echo 'Adding epel repo'
+            rpm -ivh --replacepkgs "http://dl.fedoraproject.org/pub/epel/epel-release-latest-6.noarch.rpm"
+            (($?==0)) || quit 1 'Failed to install epel repo'
+            # echo 'Changing epel repo to use http instead of https because of ancient ca-certs'
+            # sed -i 's|https://|http://|g' /etc/yum.repos.d/epel*.repo
+            ;;
+    esac
+    (($?==0)) || quit 1 'Failed to install epel repo'
+elif [[ -f /etc/debian_version ]]; then
+    OS_family=Debian
+    if ! grep -q ' xenial ' /etc/apt/sources.list; then
+        quit 1 'Only Ubuntu Xenial 16.04 supported for Debian family, check your OS version in /etc/apt/sources.list'
+    fi
+    OS=Ubuntu
+    OS_release=Xenial
+else
+    quit 1 'Unsupported OS family'
+fi
+
+
+case "${OS_family}" in
+    RedHat)
+        echo 'Installing required packages'
+        yum -y -d0 install openvpn zip unzip iptables iproute bind-utils wget openssl
+        (($?==0)) || quit 1 'Failed to install required packages'
+        ;;
+    Debian)
+        echo 'Add official openvpn repo'  # See https://community.openvpn.net/openvpn/wiki/OpenvpnSoftwareRepos
+        wget -nv -O - https://swupdate.openvpn.net/repos/repo-public.gpg | apt-key add -
+        echo "deb http://build.openvpn.net/debian/openvpn/stable ${OS_release,,} main" >/etc/apt/sources.list.d/openvpn-aptrepo.list
+        echo 'Updating packages list'
+        apt-get -yqq update
+        echo 'Installing required packages'
+        apt-get -yq install openvpn zip unzip iptables iproute2 wget dnsutils openssl netfilter-persistent
+        ;;
+esac
+(($?==0)) || quit 1 'Failed to install required packages'
+
+echo 'Check openvpn version (should be >=2.4)'
+openvpn --version | head -1
+(($?==0)) || quit 1 'Failed to check openvpn version'
+
+SERVER_LOCAL_IP=$(ip address show "${SERVER_LOCAL_IF}" | sed -n 's/ \+inet \([0-9.]\+\).*/\1/p' 2>/dev/null | grep -v 127.0.0.1 | head -1)
+echo 'Existing host IPv4 non-local interfaces:'
+# hostname -I
+ip -o -4 address | grep -v -e ': lo ' -e ': tun[0-9]\+ ' -e ': tap[0-9]\+ '
+if [[ -z ${SERVER_LOCAL_IP} ]]; then
+    echo "Cannot detect local IP for ${SERVER_LOCAL_IF} interface."
+    echo -n "Input local IP for desired interface and press enter: "
+    read SERVER_LOCAL_IP
+    if ! grep -q " inet ${SERVER_LOCAL_IP}/" < <(exec -c ip -o -4 address); then
+        quit 1 "No such local IP assigned to any interface: ${SERVER_LOCAL_IP}"
+    fi
+    SERVER_LOCAL_IF=$(ifconfig | grep -B1 "inet addr:${SERVER_LOCAL_IP}" | awk '$1!="inet" && $1!="--" {print $1}' | cut -d: -f1)
+fi
+echo "Server local interface name: ${SERVER_LOCAL_IF}"
+echo "Server local IP for openvpn server: ${SERVER_LOCAL_IP}"
+# Server public IP or domain
+SERVER_PUBLIC_IP=$(dig -4 -b "${SERVER_LOCAL_IP}" +short +time=3 +retry=1 myip.opendns.com @208.67.222.222)
+if ! validate_ip4 "${SERVER_PUBLIC_IP}"; then
+    echo "Cannot detect public IP of interface ${SERVER_LOCAL_IF}"
+    echo -n 'Input interface name: '
+    read SERVER_LOCAL_IF
+    if ! [[ -L "/sys/class/net/${SERVER_LOCAL_IF}" ]]; then
+        quit 1 "No such interface: ${SERVER_LOCAL_IF}"
+    fi
+    echo -n 'Input local IP: '
+    read SERVER_LOCAL_IP
+    if ! grep -q " inet ${SERVER_LOCAL_IP}/" < <(exec -c ip address); then
+        quit 1 "No such local IP assigned to any interface: ${SERVER_LOCAL_IP}"
+    fi
+    SERVER_PUBLIC_IP=$(dig -4 -b "${SERVER_LOCAL_IP}" +short +time=3 +retry=1 myip.opendns.com @208.67.222.222)
+    if ! validate_ip4 "${SERVER_PUBLIC_IP}"; then
+        echo -n "Cannot detect public IP of interface ${SERVER_LOCAL_IF}"
+        echo -n "Input public IP: "
+        read SERVER_PUBLIC_IP
+    fi
+else
+    echo "Server public IP detected: ${SERVER_PUBLIC_IP}"
+fi
+
+## Change work dir
+mkdir -p /etc/openvpn
+cd /etc/openvpn
+
+## Clear some dirs if any
+[[ -d /etc/openvpn/server ]]   && rm -rvf /etc/openvpn/server
+[[ -d /etc/openvpn/easy-rsa ]] && rm -rvf /etc/openvpn/easy-rsa
+[[ -d /etc/openvpn/chroot ]]   && rm -rvf /etc/openvpn/chroot
+
+echo 'Downloading easyrsa pack'
+wget -nv https://github.com/vmspike/openvpn-manage/raw/master/easyrsa3.zip  # Better to use your own link for this pack
+(($?==0)) || quit 1 'Failed to download easyrsa3.zip pack'
+## Alternatively if you have it locally, run from your PC (for Windows you can use MobaXterm or Putty):
+# scp ./easyrsa3.zip user@host:~/
+## And move to /etc/openvpn on server side:
+# mv ~user/easyrsa3.zip /etc/openvpn
+
+## Some actions to setup easyrsa
+unzip -q easyrsa3.zip
+(($?==0)) || quit 1 'Failed to unzip easyrsa3.zip pack'
+rm -f easyrsa3.zip
+mv easy-rsa-master easy-rsa
+cd /etc/openvpn/easy-rsa/easyrsa3
+./easyrsa --batch init-pki
+
+## Will ask for common name if no --batch specified
+## Example: Gabriel (default: Easy-RSA CA; batch default: ChangeMe)
+./easyrsa --batch build-ca nopass
+
+./easyrsa --batch gen-crl
+./easyrsa --batch gen-req server nopass
+./easyrsa --batch sign-req server server
+./easyrsa --batch gen-dh  # Can take few minutes depends on CPU
+
+## User openvpn already should be present but if not add it
+if ! getent passwd openvpn &>/dev/null; then
+    case "${OS_family}" in
+        RedHat)
+            adduser --system --no-create-home --home-dir /etc/openvpn --shell /sbin/nologin --gid openvpn
+            ;;
+        Debian)
+            adduser --system --no-create-home --home /nonexistent --disabled-login --group openvpn
+            ;;
+    esac
+fi
+
+mkdir -p /etc/openvpn/server/{client-configs,client-keys,client-packs,keys,scripts}
+openvpn --genkey --secret /etc/openvpn/easy-rsa/easyrsa3/pki/ta.key
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/ca.crt /etc/openvpn/server/keys/
+# ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem /etc/openvpn/server/keys/
+ln -s /etc/openvpn/chroot/crl.pem /etc/openvpn/server/keys/
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/dh.pem /etc/openvpn/server/keys/
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/issued/server.crt /etc/openvpn/server/keys/
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/private/server.key /etc/openvpn/server/keys/
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/ta.key /etc/openvpn/server/keys/ta.key
+mkdir -p /var/log/openvpn
+chown -R :openvpn /etc/openvpn/server/keys/ /var/log/openvpn /etc/openvpn/easy-rsa/easyrsa3/pki
+chmod 400 /etc/openvpn/easy-rsa/easyrsa3/pki/{ca.crt,dh.pem,issued/server.crt,private/server.key,ta.key}
+chmod 750 /etc/openvpn/server/keys
+chmod 710 /etc/openvpn/easy-rsa/easyrsa3/pki/
+chmod 440 /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem
+touch /etc/openvpn/server/{tcp,udp}.server.conf
+chown -R root:openvpn /var/log/openvpn
+chmod 755 /var/log/openvpn/
+ln -s ./server/tcp.server.conf /etc/openvpn/tcp.server.conf
+ln -s ./server/udp.server.conf /etc/openvpn/udp.server.conf
+
+## Preparations for openvpn-manage
+ln -s /etc/openvpn/server/scripts/openvpn-manage /usr/local/bin/  # So it will be available globally if /usr/localb/in in PATH environmental variable
+touch /etc/openvpn/server/users-config
+chown :openvpn /etc/openvpn/server/users-config
+chmod 640 /etc/openvpn/server/users-config
+
+## Preparations for chrooted environment
+mkdir -p /etc/openvpn/chroot/{ccd,tmp,scripts,bin,etc}
+chown root:openvpn /etc/openvpn/chroot/tmp
+chmod 775 /etc/openvpn/chroot/tmp
+cp -pf /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem /etc/openvpn/chroot/
+# ln -s /etc/openvpn/chroot/crl.pem /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem
+touch /etc/openvpn/chroot/scripts/learn-address
+chown root:openvpn /etc/openvpn/chroot/scripts/*
+chmod 754 /etc/openvpn/chroot/scripts/*
+mv /etc/openvpn/server/users-config /etc/openvpn/chroot/
+ln -s ../chroot/users-config /etc/openvpn/server/users-config
+
+## Copy openvpn-manage to /etc/openvpn/server/scripts/
+# wget -nv https://github.com/vmspike/openvpn-manage/raw/master/openvpn-manage -O /etc/openvpn/server/scripts/openvpn-manage
+read -rd '' OPENVPN_MANAGE <<'EOF_OPENVPN_MANAGE'
+#!/bin/bash
+
+##
+# Exit with optional message to stderr
+##
+quit() {
+    [[ $2 ]] && echo "$2" >&2
+    exit "${1:-0}"
 }
 
 
@@ -24,7 +294,7 @@ dec2ip() {
         _dot=.
     done
 
-    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
+    if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
 }
 
 
@@ -38,7 +308,7 @@ ip2dec() {
     IFS=. read -r _a _b _c _d <<<"$1"
     (( _res = _a*256**3 + _b*256**2 + _c*256 + _d ))
 
-    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
+    if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
 }
 
 
@@ -55,7 +325,7 @@ mask2cidr() {
     _x=${1%%$3*}
     (( _res = $2 + ${#_x}/4 ))
 
-    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
+    if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
 }
 
 
@@ -71,7 +341,7 @@ cidr2mask() {
     if (($1 > 1)); then shift "$1"; else shift; fi
     _res=${1:-0}.${2:-0}.${3:-0}.${4:-0}
 
-    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
+    if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
 }
 
 
@@ -90,7 +360,7 @@ increment_subnet() {
     dec2ip -v _ip_next $((_size+_ip_dec))
     _res=${_ip_next}/${_cidr}
 
-    if [[ ${_var} ]]; then eval "${_var}=\${_res}"; else echo "${_res}"; fi
+    if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
 }
 
 
@@ -336,11 +606,11 @@ add_client() {
     case "${CLIENT_OS}" in
         windows)
             CLIENT_CONFIG_NAME="${USER}.ovpn"
-            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOF${BR}${WIN_SPECIFIC_OPTIONS}${BR}EOF"
+            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOFOSSO${BR}${WIN_SPECIFIC_OPTIONS}${BR}${BR}#${NIX_SPECIFIC_OPTIONS//${BR}/${BR}#}${BR}${BR}EOFOSSO"
             ;;
         *)
             CLIENT_CONFIG_NAME="${USER}.conf"
-            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOF${BR}${NIX_SPECIFIC_OPTIONS}${BR}EOF"
+            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOFOSSO${BR}${NIX_SPECIFIC_OPTIONS}${BR}${BR}#${WIN_SPECIFIC_OPTIONS//${BR}/${BR}#}${BR}${BR}EOFOSSO"
     esac
 
     cd "${EASYRSA}"
@@ -402,7 +672,6 @@ add_client() {
     # Write client config
     eval "read -rd '' CLIENT_CONFIG <<EOF${BR}${CLIENT_CONFIG_TEMPLATE}${BR}EOF"
     echo "${CLIENT_CONFIG}" >"${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
-    chmod 640 "${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
     # (set -o posix; set) >&2
 
     # .zip pack beside all-in-one config
@@ -646,7 +915,7 @@ case "$1" in
 
         # Import configuration file
         . "${CONF}"
-        (($?)) && quit 1 "Failed to import configuration file: ${CONF}"
+        (($?==0)) || quit 1 "Failed to import configuration file: ${CONF}"
         # echo "${CLIENT_CONFIG_TEMPLATE}" >&2
 
         CHROOT=$(exec -c grep -m1 '^chroot ' "${SERVER_CONF}")
@@ -814,6 +1083,10 @@ case "$1" in
                                                 || quit 1 "Failed to update revocation list!"
         chown :"${OPENVPN_GROUP}" "${EASYRSA}/pki/crl.pem"
         chmod 440 "${EASYRSA}/pki/crl.pem"
+        if [[ -d /etc/openvpn/chroot ]]; then
+            rm -f /etc/openvpn/chroot/crl.pem  # Workaround for CentOS which ignore -f option for cp
+            cp -pfT "${EASYRSA}/pki/crl.pem" /etc/openvpn/chroot/crl.pem
+        fi
         # chown :${OPENVPN_GROUP} "${EASYRSA}/pki/index.txt"
         # chmod 640 "${EASYRSA}/pki/index.txt"
         # chmod g+x "${EASYRSA}/pki"
@@ -955,3 +1228,606 @@ case "$1" in
 esac
 
 exit 0
+
+EOF_OPENVPN_MANAGE
+echo "${OPENVPN_MANAGE}" >'/etc/openvpn/server/scripts/openvpn-manage'
+
+chmod +x /etc/openvpn/server/scripts/openvpn-manage
+# ln -s /etc/openvpn/server/scripts/openvpn-manage /usr/local/bin/  # Already done
+
+## Preparations for learn-address script (for dual tcp/udp server in chrooted environment)
+cd /etc/openvpn/chroot
+OPENVPN_GID=$(getent group openvpn | cut -d: -f3)
+cat >etc/busybox.conf <<EOFBUSYBOXCONF
+[SUID]
+# ${OPENVPN_GID} is openvpn group number
+iproute = sx- 0.${OPENVPN_GID}
+sh = xx- 0.${OPENVPN_GID}
+EOFBUSYBOXCONF
+wget -nv https://busybox.net/downloads/binaries/1.27.1-i686/busybox_ASH -O bin/sh
+wget -nv https://busybox.net/downloads/binaries/1.27.1-i686/busybox_IPROUTE -O bin/iproute
+chown root:root etc/busybox.conf bin/iproute
+chown root:openvpn bin/sh
+chmod 640 etc/busybox.conf
+chmod 4755 bin/iproute
+chmod 750 bin/sh
+
+## Create suitable /etc/openvpn/easy-rsa/easyrsa3/vars
+cp /etc/openvpn/easy-rsa/easyrsa3/vars{.example,}
+sed -i \
+    -e 's|^#set_var\s\+EASYRSA_TEMP_FILE\s.*|set_var EASYRSA_TEMP_FILE "/dev/shm/extensions.temp"|' \
+    -e 's|^#set_var\s\+EASYRSA_CA_EXPIRE\s.*|set_var EASYRSA_CA_EXPIRE 7300|' \
+    -e 's|^#set_var\s\+EASYRSA_CERT_EXPIRE\s.*|set_var EASYRSA_CERT_EXPIRE 7300|' \
+    -e 's|^#set_var\s\+EASYRSA_CRL_DAYS\s.*|set_var EASYRSA_CRL_DAYS 7300|' \
+    -e 's|^#set_var\s\+EASYRSA_REQ_CN\s.*|set_var EASYRSA_REQ_CN "server"|' \
+    -e 's|^#set_var\s\+EASYRSA_BATCH\s.*|set_var EASYRSA_BATCH "neveraskmehoney"|' \
+    /etc/openvpn/easy-rsa/easyrsa3/vars
+
+## Fix CRL issue when in chroot
+# sed -i \
+#     -e 's|^crl_dir\s*=\s*$dir|crl_dir\t = /etc/openvpn/chroot|' \
+#     -e 's|^crl\s*=\s*$dir|crl\t = /etc/openvpn/chroot|' \
+#     /etc/openvpn/easy-rsa/easyrsa3/openssl-1.0.cnf
+
+
+## Create suitable /etc/openvpn/server/users-config (Used for selectable forwarding)
+echo 'push "redirect-gateway def1"
+push "dhcp-option DNS 8.8.8.8"
+push "dhcp-option DNS 208.67.222.222"
+' >/etc/openvpn/server/users-config
+
+
+## Create configs
+# /etc/openvpn/chroot/scripts/learn-address
+read -rd '' LEARN_ADDRESS <<'EOF_LEARN_ADDRESS'
+#!/bin/sh
+
+##
+# This script allows to share the same VPN subnet between TCP and UDP openvpn server
+# Sudoers have to be setup to allow openvpn user to change routing table.
+#
+# This file created to work in chrooted environment using busybox
+##
+
+
+# Operation: "add", "update", or "delete" based on whether or not the address is being added to, modified, or deleted from OpenVPN's internal routing table.
+MODE=$1
+
+# Address: The address being learned or unlearned.
+# This can be an IPv4 address such as "198.162.10.14",
+# an IPv4 subnet such as "198.162.10.0/24",
+# or an ethernet MAC address (when --dev tap is being used) such as "00:FF:01:02:03:04".
+IP=$2
+
+# Common Name: The common name on the certificate associated with the client linked to this address.
+# Only present for "add" or "update" operations, not "delete".
+# CN=$3
+
+# Some environmental variables also available, e.g.: dev
+
+case "${MODE}" in
+    add|update)
+        # exec -c sudo ip route add ${IP} dev ${dev} proto static scope link
+        echo "Learn: iproute del ${IP}"
+        iproute del ${IP}
+        echo "Learn: iproute add ${IP} dev ${dev} proto static scope link"
+        iproute add ${IP} dev ${dev} proto static scope link
+        ;;
+esac
+EOF_LEARN_ADDRESS
+echo "${LEARN_ADDRESS}" >'/etc/openvpn/chroot/scripts/learn-address'
+
+# /etc/openvpn/server/scripts/openvpn-manage.conf  # Change SERVER_PUBLIC_IP to your server public IP or domain
+read -rd '' OPENVPN_MANAGE_CONF <<EOF_OPENVPN_MANAGE_CONF
+##
+# Configuration file for openvpn-manage.
+# Bash syntax required
+# Easyrsa 'vars' file have to be properly setup before
+##
+
+
+## Usually you don't need to change these options
+# SERVER_DIR='/etc/openvpn/server'
+# KEYS_DIR="\${SERVER_DIR}/keys"
+# CLIENT_KEYS_DIR="\${SERVER_DIR}/client-keys"
+# CLIENT_PACKS_DIR="\${SERVER_DIR}/client-packs"
+# CLIENT_CONFIG_DIR="\${SERVER_DIR}/client-configs"
+CLIENT_CONFIG_DIR='/etc/openvpn/chroot/ccd'
+# USERS_CONF="\${SERVER_DIR}/users-config"
+SERVER_CONF='/etc/openvpn/udp.server.conf'  # If tcp and udp servers subnet are the same, any config is fine here
+# EASYRSA='/etc/openvpn/easy-rsa/easyrsa3'
+CLIENT_OS_DEFAULT='windows'  # 'nix' for Unix-based OS, 'windows' for Windows
+# OPENVPN_USER=openvpn
+# OPENVPN_GROUP=openvpn
+
+# CA_PASS='no'  # 'yes' if CA is password protected
+
+## Example of variables which can be used in client config options
+## You can also use custom variables specified in this file
+# CLIENT_CONFIG_DIR=/etc/openvpn/chroot/ccd
+# CLIENT_CONFIG_NAME=00008-win-test.conf
+# CLIENT_PACKS_DIR=/etc/openvpn/server/client-packs
+# CLIENT_KEYS_DIR=/etc/openvpn/server/client-keys
+# CLIENT_OS=nix
+# CLIENT_OVPN_IP=172.31.240.8
+# CLIENT_TYPE=user
+# EASYRSA=/etc/openvpn/easy-rsa/easyrsa3
+# FIRST_CLIENT_CONFIG_FILE=/etc/openvpn/chroot/ccd/00006-win-test
+# FLNUMBER=00008
+# HOST_NAME=win-test
+# HOST_NAME_ALLOWED_REGEX='^[A-Za-z0-9_-]+\$'
+# INITIAL_IROUTE_SUBNET=10.10.0.0/29
+# KEYS_DIR=/etc/openvpn/server/keys
+# LAST_IROUTE_SUBNET_FILE=/etc/openvpn/server/last_iroute_subnet
+# N=2
+# OPENVPN_GROUP=openvpn
+# OPENVPN_USER=openvpn
+# OS_SPECIFIC_OPTIONS  # WIN_SPECIFIC_OPTIONS or NIX_SPECIFIC_OPTIONS
+# SERVER_CONF=/etc/openvpn/udp.server.conf
+# SERVER_DIR=/etc/openvpn/server
+# USER=00008-win-test
+# USERS_CONF=/etc/openvpn/server/users-config
+##
+
+## Client config options
+# OS_SPECIFIC_OPTIONS will be replaced to NIX_SPECIFIC_OPTIONS or WIN_SPECIFIC_OPTIONS depends on CLIENT_OS
+read -rd '' CLIENT_CONFIG_TEMPLATE <<'EOF'
+# OpenVPN 2.4 client \${CLIENT_OS} config file \${N} for host "\${HOST_NAME}"
+
+# When  connecting to a remote server do not wait for more than n seconds
+# waiting for a response before trying the next server. The default value is 120s.
+# This timeout includes proxy and TCP connect timeouts.
+server-poll-timeout 12
+
+;remote-random
+;local 192.168.1.\$((N%245+10))
+nobind
+${link_mtu} 1420
+mssfix 0
+server-poll-timeout 15
+
+client
+dev tun
+cipher AES-256-GCM
+auth SHA256
+comp-lzo
+resolv-retry infinite
+remote-cert-tls server
+sndbuf 0
+rcvbuf 0
+reneg-sec 0
+verb 3
+;mute 10
+
+# For single connection persist-* and user/group options can be uncommented
+# For dual it's better to keep them commented, otherwise openvpn cannot
+# change connection without full restart
+;persist-key
+;persist-tun
+;persist-remote-ip
+auth-nocache
+
+ignore-unknown-option block-outside-dns dhcp-renew register-dns tap-sleep dhcp-release dhcp-option
+
+\${OS_SPECIFIC_OPTIONS}
+
+<connection>
+remote ${SERVER_PUBLIC_IP} 443 udp4
+${mssfix} 1428
+</connection>
+
+<connection>
+remote ${SERVER_PUBLIC_IP} 443 tcp4
+mssfix 0
+</connection>
+
+# Certificates and keys
+<ca>
+\$(< "\${SERVER_DIR}/keys/ca.crt")
+</ca>
+<cert>
+\$(< "\${EASYRSA}/pki/issued/\${USER}.crt")
+</cert>
+<key>
+\$(< "\${EASYRSA}/pki/private/\${USER}.key")
+</key>
+key-direction 1
+<tls-auth>
+\$(< "\${SERVER_DIR}/keys/ta.key")
+</tls-auth>
+EOF
+
+read -rd '' NIX_SPECIFIC_OPTIONS <<'EOF'
+# *nix specific options (Linux/Mac/BSD)
+;user openvpn
+;group openvpn
+nice 5
+;log-append "/var/log/openvpn/\${USER}.log"
+EOF
+NIX_SPECIFIC_OPTIONS=\${NIX_SPECIFIC_OPTIONS/%\$'\n'}
+
+read -rd '' WIN_SPECIFIC_OPTIONS <<'EOF'
+# Windows specific options
+block-outside-dns
+dhcp-renew
+register-dns
+tap-sleep 1
+EOF
+WIN_SPECIFIC_OPTIONS=\${WIN_SPECIFIC_OPTIONS/%\$'\n'}
+
+## Additional variables
+# INITIAL_IROUTE_SUBNET=10.10.0.0/29
+# LAST_IROUTE_SUBNET_FILE=\${SERVER_DIR}/last_iroute_subnet
+# # Warning! Be careful - support of extended range of symbols could lead to script errors or unexpected behavior!
+# HOST_NAME_ALLOWED_REGEX='^[A-Za-z0-9_-]+\$'  # Regex type of =~ bash operator (extended regular expression)
+# ALLOW_DIFFERENT_CLIENT_TYPES_FOR_HOST=no
+
+:  # For succesfull import
+EOF_OPENVPN_MANAGE_CONF
+echo "${OPENVPN_MANAGE_CONF}" >'/etc/openvpn/server/scripts/openvpn-manage.conf'
+
+
+# To allow openvpn server listen on any IP uncomment line with `multihome` and comment `local` (comments is lines starts with ; or #) in openvpn server configs (and restart openvpn server).
+# /etc/openvpn/server/tcp.server.conf  # Change SERVER_LOCAL_IP to interface local IP (could be different with public IP or the same)
+read -rd '' TCP_SERVER_CONF <<EOF_TCP_SERVER_CONF
+## OpenVPN 2.4 UDP server config file
+
+# Must match IP of base network adapter
+;local ${SERVER_LOCAL_IP}
+multihome
+
+# Base dir for options with relative paths
+cd /etc/openvpn/chroot
+
+## UDP server specific options
+# proto udp4
+# dev tun0
+# # Keep client IP for a day (86400)
+# ;ifconfig-pool-persist ipp.udp.server.txt 86400
+# # Make replay-window twice larger due to laggy clients
+# replay-window 80 20
+# fast-io
+# ${mssfix} 1428
+# ${link_mtu} 1420
+# ;connect-freq 20 1
+# status /var/log/openvpn/status.udp.server.txt 10
+# # journalctl will be used for logging too
+# log-append /var/log/openvpn/udp.server.log
+# replay-persist /var/log/openvpn/replay-persist.udp.server.txt
+# # Management interface
+# ;management /run/openvpn/mgmt.udp.server.socket unix
+## END UDP server specific options
+
+## TCP server specific options
+proto tcp4
+dev tun1
+# Keep client IP for a day (86400)
+;ifconfig-pool-persist /var/log/openvpn/ipp.tcp.server.txt 86400
+mssfix 0
+${link_mtu} 1420
+tcp-nodelay
+tcp-queue-limit 64
+status /var/log/openvpn/status.tcp.server.txt 10
+# journalctl will be used for logging too
+log-append /var/log/openvpn/tcp.server.log
+replay-persist /var/log/openvpn/replay-persist.tcp.server.txt
+# Management interface
+;management /run/openvpn/mgmt.tcp.server.socket unix
+## END TCP server specific options
+
+lport 443
+server 172.16.16.0 255.255.255.0 nopool
+# Reserve some small VPN IP's for possible internal needs
+ifconfig-pool 172.16.16.0 172.16.16.254 255.255.255.0
+# If you want traffic between clients go through firewall do not enable client-to-client
+;client-to-client
+
+# WARNING: --ifconfig-pool-persist will not work with --duplicate-cn
+;duplicate-cn
+
+topology subnet
+;tun-mtu 1500
+;tun-mtu-extra 0
+;txqueuelen 500
+status-version 1
+tls-timeout 2
+
+# On client side reneg-sec set to 0 by default,
+# so this value (lowest positive) will be really used for most users
+# 14400: 4h (default 3600: 1h)
+reneg-sec 3600
+
+ca /etc/openvpn/server/keys/ca.crt
+cert /etc/openvpn/server/keys/server.crt
+key /etc/openvpn/server/keys/server.key
+dh /etc/openvpn/server/keys/dh.pem
+crl-verify crl.pem
+# tls-auth, replay-persist, connect-freq are good for basic DDoS protection
+tls-auth /etc/openvpn/server/keys/ta.key 0
+
+# Decrease openvpn process priority
+nice 5
+
+# Generally it's good to set proper max-clients value to avoid server freeze
+max-clients 1024
+;hash-size 1024 1024
+;bcast-buffers 128
+
+;management-client-user openvpn
+;management-client-group openvpn
+
+# Use separate user
+user openvpn
+group openvpn
+
+;cipher AES-128-CBC
+cipher AES-256-GCM
+;auth SHA1
+;auth ecdsa-with-SHA1
+auth SHA256
+tls-cipher TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256:TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256:TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384:TLS-DHE-RSA-WITH-AES-256-CBC-SHA256:TLS-DHE-RSA-WITH-AES-256-GCM-SHA384
+tls-version-min 1.2
+;opt-verify
+
+;script-security 1
+script-security 2
+learn-address scripts/learn-address
+;client-connect scripts/client-connect
+;client-disconnect scripts/client-disconnect
+ccd-exclusive
+client-config-dir ccd
+tmp-dir tmp
+
+mute-replay-warnings
+verb 4
+
+keepalive 10 40
+persist-key
+persist-tun
+persist-local-ip
+
+# For uncompressable data (images, media) or high bandwidth better to use "comp-lzo no"
+# For other cases "adaptive" or "yes"
+comp-lzo adaptive
+push "comp-lzo adaptive"
+
+# For additional options see /etc/openvpn/server/users-config
+# and per client configs in client-config-dir
+
+chroot /etc/openvpn/chroot
+EOF_TCP_SERVER_CONF
+echo "${TCP_SERVER_CONF}" >'/etc/openvpn/server/tcp.server.conf'
+
+
+# /etc/openvpn/server/udp.server.conf  # Clone from udp.server.conf via uncommenting udp block and commenting tcp
+read -rd '' UDP_SERVER_CONF <<EOF_UDP_SERVER_CONF
+## OpenVPN 2.4 UDP server config file
+
+# Must match IP of base network adapter
+;local ${SERVER_LOCAL_IP}
+multihome
+
+# Base dir for options with relative paths
+cd /etc/openvpn/chroot
+
+## UDP server specific options
+proto udp4
+dev tun0
+# Keep client IP for a day (86400)
+;ifconfig-pool-persist ipp.udp.server.txt 86400
+# Make replay-window twice larger due to laggy clients
+replay-window 80 20
+fast-io
+${mssfix} 1428
+${link_mtu} 1420
+;connect-freq 20 1
+status /var/log/openvpn/status.udp.server.txt 10
+# journalctl will be used for logging too
+log-append /var/log/openvpn/udp.server.log
+replay-persist /var/log/openvpn/replay-persist.udp.server.txt
+# Management interface
+;management /run/openvpn/mgmt.udp.server.socket unix
+## END UDP server specific options
+
+## TCP server specific options
+# proto tcp4
+# dev tun1
+# # Keep client IP for a day (86400)
+# ;ifconfig-pool-persist /var/log/openvpn/ipp.tcp.server.txt 86400
+# ${link_mtu} 1420
+# tcp-nodelay
+# tcp-queue-limit 64
+# status /var/log/openvpn/status.tcp.server.txt 10
+# # journalctl will be used for logging too
+# log-append /var/log/openvpn/tcp.server.log
+# replay-persist /var/log/openvpn/replay-persist.tcp.server.txt
+# # Management interface
+# ;management /run/openvpn/mgmt.tcp.server.socket unix
+## END TCP server specific options
+
+lport 443
+server 172.16.16.0 255.255.255.0 nopool
+# Reserve some small VPN IP's for possible internal needs
+ifconfig-pool 172.16.16.0 172.16.16.254 255.255.255.0
+# If you want traffic between clients go through firewall do not enable client-to-client
+;client-to-client
+
+# WARNING: --ifconfig-pool-persist will not work with --duplicate-cn
+;duplicate-cn
+
+topology subnet
+;tun-mtu 1500
+;tun-mtu-extra 0
+;txqueuelen 500
+status-version 1
+tls-timeout 2
+
+# On client side reneg-sec set to 0 by default,
+# so this value (lowest positive) will be really used for most users
+# 14400: 4h (default 3600: 1h)
+reneg-sec 3600
+
+ca /etc/openvpn/server/keys/ca.crt
+cert /etc/openvpn/server/keys/server.crt
+key /etc/openvpn/server/keys/server.key
+dh /etc/openvpn/server/keys/dh.pem
+crl-verify crl.pem
+# tls-auth, replay-persist, connect-freq are good for basic DDoS protection
+tls-auth /etc/openvpn/server/keys/ta.key 0
+
+# Decrease openvpn process priority
+nice 5
+
+# Generally it's good to set proper max-clients value to avoid server freeze
+max-clients 1024
+;hash-size 1024 1024
+;bcast-buffers 128
+
+;management-client-user openvpn
+;management-client-group openvpn
+
+# Use separate user
+user openvpn
+group openvpn
+
+;cipher AES-128-CBC
+cipher AES-256-GCM
+;auth SHA1
+;auth ecdsa-with-SHA1
+auth SHA256
+tls-cipher TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256:TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256:TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384:TLS-DHE-RSA-WITH-AES-256-CBC-SHA256:TLS-DHE-RSA-WITH-AES-256-GCM-SHA384
+tls-version-min 1.2
+;opt-verify
+
+;script-security 1
+script-security 2
+learn-address scripts/learn-address
+;client-connect scripts/client-connect
+;client-disconnect scripts/client-disconnect
+ccd-exclusive
+client-config-dir ccd
+tmp-dir tmp
+
+mute-replay-warnings
+verb 4
+
+keepalive 10 40
+persist-key
+persist-tun
+persist-local-ip
+
+# For uncompressable data (images, media) or high bandwidth better to use "comp-lzo no"
+# For other cases "adaptive" or "yes"
+comp-lzo adaptive
+push "comp-lzo adaptive"
+
+# For additional options see /etc/openvpn/server/users-config
+# and per client configs in client-config-dir
+
+chroot /etc/openvpn/chroot
+EOF_UDP_SERVER_CONF
+echo "${UDP_SERVER_CONF}" >'/etc/openvpn/server/udp.server.conf'
+## END Create configs
+
+## Configure SELinux if required
+if hash sestatus 2>/dev/null && sestatus | grep -q 'SELinux status:\s\+enabled'; then
+    echo 'SELinux enabled, creating the rule to allow openvpn server to run on non standard UDP port 443...'
+    hash semanage 2>/dev/null || yum -y -d0 install policycoreutils-python
+    semanage port -a -t openvpn_port_t -p udp 443
+fi
+
+echo 'Stop/Start OpenVPN server'
+if pidof systemd >/dev/null; then  # CentOS 7, Ubuntu Xenial
+    systemctl stop openvpn@udp.server.service
+    systemctl stop openvpn@tcp.server.service
+    systemctl start openvpn@udp.server.service
+    systemctl start openvpn@tcp.server.service
+else  # CentOS 6, Ubuntu Trusty
+    service openvpn stop
+    service openvpn start
+fi
+echo 'Sleeping for 5 sec to give openvpn server time to start...'
+sleep 5
+
+## Check log
+echo $'\n''Tail of udp.server.log:'
+tail /var/log/openvpn/udp.server.log
+echo $'\n''Tail of tcp.server.log:'
+tail /var/log/openvpn/tcp.server.log
+echo
+
+read -rd '' IPTABLES_RULES <<EOF_IPTABLES_RULES
+## Forwarding setup
+iptables -P FORWARD DROP
+iptables -I FORWARD -i tun+ -o ${SERVER_LOCAL_IF} -j ACCEPT
+iptables -I FORWARD -i ${SERVER_LOCAL_IF} -o tun+ -j ACCEPT
+
+## Enable SNAT (default). For dynamic server IP use "-j MASQUERADE" instead of "-j SNAT ..."
+iptables -t nat -A POSTROUTING -o ${SERVER_LOCAL_IF}  -j SNAT --to-source ${SERVER_LOCAL_IP}
+## Different SNAT for specific VPN clients. E.g.:
+# iptables -t nat -I POSTROUTING -s 172.16.16.2 -o ${SERVER_LOCAL_IF}  -j SNAT --to-source SERVER_LOCAL_IP1
+# iptables -t nat -I POSTROUTING -s 172.16.16.3 -o ${SERVER_LOCAL_IF}  -j SNAT --to-source SERVER_LOCAL_IP2
+# iptables -t nat -I POSTROUTING -s 172.16.16.4 -o ${SERVER_LOCAL_IF}  -j SNAT --to-source SERVER_LOCAL_IP3
+# ...
+
+## Open ports (if required)
+iptables -I INPUT 1 -p udp --dport 443 -i ${SERVER_LOCAL_IF} -j ACCEPT
+iptables -I INPUT 1 -p tcp --dport 443 -i ${SERVER_LOCAL_IF} -j ACCEPT
+EOF_IPTABLES_RULES
+
+echo 'Evaluate iptables rules and save'
+# Evaluate
+eval "${IPTABLES_RULES}"
+# Save
+if [[ "${OS}" == 'CentOS' ]]; then
+    service iptables save
+elif [[ "${OS}" == 'Ubuntu' ]]; then
+    netfilter-persistent save
+    netfilter-persistent reload
+fi
+
+echo 'Setup /etc/rc.local for forwarding'
+sed -i 's/^exit 0$//' /etc/rc.local
+comment='OpenVPN forwarding'
+sed -i "/^# ${comment}/,/^# END ${comment}/d" /etc/rc.local  # Remove OpenVPN forwarding rules from rc.local
+IPTABLES_RULES_COMMENTED=${IPTABLES_RULES//$'\n'/$'\n'# }
+read -rd '' RC_LOCAL <<EOF_RC_LOCAL
+## ${comment}
+echo 1 >/proc/sys/net/ipv4/ip_forward
+
+# Saved to /etc/sysconfig/iptables, so commented here
+# ${IPTABLES_RULES_COMMENTED}
+## END ${comment}
+
+exit 0
+EOF_RC_LOCAL
+echo $'\n'"${RC_LOCAL}" >>/etc/rc.local
+echo 1 >/proc/sys/net/ipv4/ip_forward
+
+echo 'It is possible that you need to adopt firewall (iptables rules) to your setup, refer comments in /etc/rc.local'
+# echo '/etc/rc.local content:'
+# cat /etc/rc.local
+# echo 'END of /etc/rc.local'
+
+echo '
+Make sure you have opened ports for openvpn server in VPS firewall (443 tcp and udp in this case)
+If your VM/VPS has local firewall rules you probably have to change iptables rules to fit them and save them.
+'
+echo 'Firewall status:'
+# iptables -vnL; echo; iptables -vnL -t nat
+if ((CentOS_major == 6)); then
+    service iptables status
+else
+    iptables -vnL
+    echo $'\n'
+    iptables -t nat -vnL
+fi
+
+## Create client certs/configs
+# echo 'Creating test openvpn user:'
+# openvpn-manage create test
+echo 'To add users use: sudo openvpn-manage create usernamehere'
+echo 'For help run openvpn-manage without arguments'
+echo 'To download all configs locally you can run on your PC:'${BR}"scp root@${SERVER_PUBLIC_IP}:/etc/openvpn/server/client-packs/*/*.*[fn] ./"
+
+echo 'Configuration completed'
