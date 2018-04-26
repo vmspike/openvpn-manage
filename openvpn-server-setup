@@ -126,7 +126,7 @@ fi
 case "${OS_family}" in
     RedHat)
         echo 'Installing required packages'
-        yum -y -d0 install openvpn zip unzip iptables iproute bind-utils wget openssl
+        yum -y -d0 install openvpn zip unzip iptables iproute bind-utils wget openssl netcat-openbsd
         (($?==0)) || quit 1 'Failed to install required packages'
         ;;
     Debian)
@@ -138,7 +138,7 @@ case "${OS_family}" in
         echo 'Updating packages list'
         apt-get -yqq update
         echo 'Installing required packages'
-        apt-get -yq install openvpn zip unzip iptables iproute2 wget dnsutils openssl netfilter-persistent
+        apt-get -yq install openvpn zip unzip iptables iproute2 wget dnsutils openssl netfilter-persistent netcat-openbsd
         ;;
 esac
 (($?==0)) || quit 1 'Failed to install required packages'
@@ -276,6 +276,106 @@ ln -s ../chroot/users-config /etc/openvpn/server/users-config
 read -rd '' OPENVPN_MANAGE <<'EOF_OPENVPN_MANAGE'
 #!/bin/bash
 
+SCRIPT_VERSION='0.7.0'
+
+read -rd '' HELP <<'EOF'
+Description:
+    This tool created to support user management for specific openvpn server setup
+    by openvpn-server-setup tool.
+
+    Some script terms:
+    - host: the name of specific host (specific host can have several clients/certs).
+    - client: specific vpn-client/cert for the host.
+
+Usage:
+    openvpn-manage ACTION { PARAMS } [ OPTIONS ]
+    ACTION := { usage | help | create | append | enable | disable | revoke | list | show }
+    OPTIONS := { -f CONF | -t CLIENT_TYPE | -s IP/CIDR | -c COUNT | -o CLIENT_OS | -e | -d | -v }
+    CLIENT_TYPE := { user | router }
+    CLIENT_OS := { windows | nix }
+
+    openvpn-manage { create | append } HOST_NAME [ OPTIONS ]
+
+    openvpn-manage { enable | disable | revoke } { host HOST_NAME | client CLIENT_NAME }
+
+    openvpn-manage list { host[s] | client[s] } [ HOST_NAME ] { -t CLIENT_TYPE | -s CLIENT_SUBNET_BEHIND | -e | -d }
+
+    openvpn-manage show { host HOST_NAME | client CLIENT_NAME }
+
+Actions:
+    create host HOST_NAME
+    append client HOST_NAME
+        Used for create/append clients to HOST_NAME.
+        Difference is:
+        validation - you can't create host if HOST_NAME already exist and you can't
+            append clients to non-existent host.
+        subnet applying for type router - for "append" if -s not specified additional clients of
+            the host will have the same subnet as first available iroute option
+            in first available client config.
+
+    enable, disable, revoke
+        You can enable/disable/revoke specific client (client CLIENT_NAME) or all clients
+        (host HOST_NAME) of the host.
+        Enable and disable just delete/add 'disable' line to client config, so client can't
+        connect. Host/client can be enabled/disabled any time.
+        revoke adds client[s] cert[s] to revocation list, so it could be treated as
+        persistent client deactivation.
+        Note: revoked cert still can be unrevoked manually, but it's not supported
+        by openvpn-manage.
+
+    list
+        List hosts or clients depends on filter options.
+        For HOST_NAME grep standard regexp's supported.
+        Examples:
+            List all hosts:
+                list hosts
+            List all routers clients:
+                list clients -t router
+            List enabled clients of specific host with specified internal subnet:
+                list clients HOST_NAME -e -s 10.10.0.8/29
+
+Options:
+    -f CONF
+        Configuration file of openvpn-manage
+        Default: /etc/openvpn/server/scripts/openvpn-manage.conf
+
+    -t CLIENT_TYPE
+        Could be "user" (default) or "router". Difference is client config options.
+        User config contain push "route ..." to the routers internal subnets.
+        Router config contain iroute to internal subnet behind it.
+
+    -s CLIENT_SUBNET_BEHIND
+        Format: IP/CIDR. Subnet behind the router. Valid only if CLIENT_TYPE is "router".
+        If no subnet specified subnet will be incremented from the last saved subnet.
+        Subnet will be saved to LAST_IROUTE_SUBNET_FILE. If no file exist
+        INITIAL_IROUTE_SUBNET will be used and then saved to LAST_IROUTE_SUBNET_FILE.
+        Subnet will be saved only if -s option omitted, so manually specified subnet
+        will not be saved in LAST_IROUTE_SUBNET_FILE. It's allow manually specify
+        subnet without interrupt existing subnet chain.
+
+    -c COUNT
+        Default is 1. Allow to create COUNT clients/certs for the host with single
+        command. Additional host clients/certs could be added via action "append"
+        next time.
+
+    -e, -d
+        List enabled/disabled only.
+
+    -z {0 | 1}
+        If 1 create zip packs (default: 0).
+
+    -r REMOTE_IP[:REMOTE_PORT]
+        Overwrite config REMOTE_IP and optionally REMOTE_PORT variables
+
+    -v {default | debug | none | conf}
+        Set stdout verbosity:
+            debug: verbose output
+            default: normal output
+            none: completely quite, only errrors can be print to stderr
+            conf: print only single generated config content for action "create"
+EOF
+
+
 ##
 # Exit with optional message to stderr
 ##
@@ -289,16 +389,16 @@ quit() {
 # Convert decimal number to IPv4 address
 ##
 dec2ip() {
-    local _var _res _e _dot _octet _dec
+    local _var _res _e _octet _dec
     if [[ $1 == '-v' ]]; then _var=$2; shift 2; fi
 
     _dec=$1
     for _e in {3..0}; do
         (( _octet = _dec/256**_e ))
         (( _dec -= _octet*256**_e ))
-        _res+=${_dot}${_octet}
-        _dot=.
+        _res+=.${_octet}
     done
+    _res=${_res:1}
 
     if [[ ${_var} ]]; then printf -v "${_var}" '%s' "${_res}"; else echo "${_res}"; fi
 }
@@ -423,6 +523,26 @@ validate_client_name() {
 }
 
 
+##
+# Attempt to kill client connection on both tcp and udp servers if management interface is enabled
+##
+kill_existing_client_connection() {
+    local _cn
+    _cn=$1
+    if [[ -n "${TCP_MANAGEMENT_SOCKET}" && -S "${TCP_MANAGEMENT_SOCKET}" ]]; then
+        # Kill existing connection if any
+        sudo -u "${TCP_MANAGEMENT_USER}" -g "${TCP_MANAGEMENT_GROUP}" nc -U "${TCP_MANAGEMENT_SOCKET}" <<<"kill ${_cn}" >/dev/null
+        # TODO: implement for TCP_MANAGEMENT_IP:TCP_MANAGEMENT_PORT
+    fi
+    if [[ -n "${UDP_MANAGEMENT_SOCKET}" && -S "${UDP_MANAGEMENT_SOCKET}" ]]; then
+        # Kill existing connection if any
+        sudo -u "${UDP_MANAGEMENT_USER}" -g "${UDP_MANAGEMENT_GROUP}" nc -U "${UDP_MANAGEMENT_SOCKET}" <<<"kill ${_cn}" >/dev/null
+        # TODO: implement for UDP_MANAGEMENT_IP:UDP_MANAGEMENT_PORT
+    fi
+    return 0 # Always return 0
+}
+
+
 revoke_cert() {
     local _cn
     _cn=$1
@@ -432,6 +552,8 @@ revoke_cert() {
         if (($?)); then
             quit 1 "${_cn}: failed to revoke cert"
         else
+            # TODO: after killing connection crl-verify file is still not updated so client may have enough time to reconnect (?)
+            kill_existing_client_connection "${_cn}"
             echo "${_cn}: cert revoked"
         fi
     else
@@ -445,6 +567,7 @@ disable_client() {
     _cn=$1
     if ! grep -q '^disable$' "${CLIENT_CONFIG_DIR}/${_cn}"; then
         echo disable >>"${CLIENT_CONFIG_DIR}/${_cn}"
+        kill_existing_client_connection "${_cn}"
         echo "${_cn}: disabled"
     else
         echo "${_cn}: was already disabled!"
@@ -604,7 +727,7 @@ show_client() {
 
 
 add_client() {
-    local HOST_NAME FLNUMBER NUMBER USER CLIENT_CONFIG_NAME DEC_IP srv TMP_USER_DIR
+    local HOST_NAME FLNUMBER NUMBER USER CLIENT_CONFIG_NAME DEC_IP srv TMP_USER_DIR OVPN_CONF_CONTENT
     HOST_NAME=$1
     printf -v FLNUMBER '%05d' $(( 16#$(< "${EASYRSA}/pki/serial") ))
     (( NUMBER = 10#${FLNUMBER} ))
@@ -612,11 +735,11 @@ add_client() {
     case "${CLIENT_OS}" in
         windows)
             CLIENT_CONFIG_NAME="${USER}.ovpn"
-            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOFOSSO${BR}${WIN_SPECIFIC_OPTIONS}${BR}${BR}#${NIX_SPECIFIC_OPTIONS//${BR}/${BR}#}${BR}${BR}EOFOSSO"
+            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOF${BR}${WIN_SPECIFIC_OPTIONS}${BR}EOF"
             ;;
         *)
             CLIENT_CONFIG_NAME="${USER}.conf"
-            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOFOSSO${BR}${NIX_SPECIFIC_OPTIONS}${BR}${BR}#${WIN_SPECIFIC_OPTIONS//${BR}/${BR}#}${BR}${BR}EOFOSSO"
+            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOF${BR}${NIX_SPECIFIC_OPTIONS}${BR}EOF"
     esac
 
     cd "${EASYRSA}"
@@ -625,7 +748,7 @@ add_client() {
     ./easyrsa --batch --req-cn="${USER}" sign-req client "${USER}" &>"${DESCRIPTOR}" || quit 1 "Easyrsa error: $?"
 
     # Change CN in Authority Key Identifier DirName for compatibility with Netcomm routers openvpn interface
-    sed -i -e "s/\/CN=server\//\/CN=${USER}\//" -e "s/\/CN=server$/\/CN=${USER}/" "${EASYRSA}/pki/issued/${USER}.crt"
+    sed -i -e "s|/CN=server/|/CN=${USER}/|" -e "s|/CN=server$|/CN=${USER}|" "${EASYRSA}/pki/issued/${USER}.crt"
 
     # Calculate client OVPN IP and NETMASK
     srv=$(exec -c grep -m1 '^server ' "${SERVER_CONF}")
@@ -678,6 +801,7 @@ add_client() {
     # Write client config
     eval "read -rd '' CLIENT_CONFIG <<EOF${BR}${CLIENT_CONFIG_TEMPLATE}${BR}EOF"
     echo "${CLIENT_CONFIG}" >"${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
+    chown -R :sudo "${CLIENT_PACKS_DIR}/${HOST_NAME}"
     # (set -o posix; set) >&2
 
     # .zip pack beside all-in-one config
@@ -685,16 +809,26 @@ add_client() {
     #     ${USER}.tgz with ca.crt ${USER}.key ${USER}.crt
     #     ta.key
     #     ${USER} all-in-one conf
-    TMP_USER_DIR="/tmp/openvpn-manage/${USER}"
-    mkdir -p "${TMP_USER_DIR}"
-    tar --transform 's/.*\///g' -zchf "${TMP_USER_DIR}/${USER}.tgz" "./pki/private/${USER}.key" "./pki/issued/${USER}.crt" ./pki/ca.crt &>"${DESCRIPTOR}"
-    cp -l ./pki/ta.key "${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}" "${TMP_USER_DIR}/" &>"${DESCRIPTOR}" || \
-        cp ./pki/ta.key "${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}" "${TMP_USER_DIR}/" &>"${DESCRIPTOR}"
-    zip -rjD "${CLIENT_PACKS_DIR}/${HOST_NAME}/${USER}.zip" "${TMP_USER_DIR}/" &>"${DESCRIPTOR}"
-    rm "${TMP_USER_DIR}/"{"${USER}.tgz",ta.key,"${CLIENT_CONFIG_NAME}"} &>"${DESCRIPTOR}" && rm -r "${TMP_USER_DIR}/" &>"${DESCRIPTOR}"
+    if ((CREATE_ZIP)); then
+        TMP_USER_DIR="/tmp/openvpn-manage/${USER}"
+        mkdir -p "${TMP_USER_DIR}"
+        tar --transform 's/.*\///g' -zchf "${TMP_USER_DIR}/${USER}.tgz" "./pki/private/${USER}.key" "./pki/issued/${USER}.crt" ./pki/ca.crt &>"${DESCRIPTOR}"
+        cp -l ./pki/ta.key "${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}" "${TMP_USER_DIR}/" &>"${DESCRIPTOR}" || \
+            cp ./pki/ta.key "${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}" "${TMP_USER_DIR}/" &>"${DESCRIPTOR}"
+        zip -rjD "${CLIENT_PACKS_DIR}/${HOST_NAME}/${USER}.zip" "${TMP_USER_DIR}/" &>"${DESCRIPTOR}"
+        rm "${TMP_USER_DIR}/"{"${USER}.tgz",ta.key,"${CLIENT_CONFIG_NAME}"} &>"${DESCRIPTOR}" && rm -r "${TMP_USER_DIR}/" &>"${DESCRIPTOR}"
 
-    [[ ${DESCRIPTOR} == /dev/null ]] || echo "${BR}${BR}"
-    echo "${USER}: config created:${BR}${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
+        [[ ${DESCRIPTOR} == /dev/null ]] || echo "${BR}${BR}"
+    fi
+
+    if [[ "${VERB}" == conf ]]; then
+        read -rd '' OVPN_CONF_CONTENT <"${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
+        echo "${OVPN_CONF_CONTENT}"
+    elif [[ "${VERB}" == none ]]; then
+        :
+    else
+        echo "${USER}: config created:${BR}${CLIENT_PACKS_DIR}/${HOST_NAME}/${CLIENT_CONFIG_NAME}"
+    fi
     cd - >/dev/null
 }
 
@@ -737,9 +871,11 @@ create_host() {
         echo
     done
 
-    zip --exclude \*.zip -rjD "${CLIENT_PACKS_DIR}/${HOST_NAME}.zip" "${CLIENT_PACKS_DIR}/${HOST_NAME}/" >/dev/null
-    echo
-    echo "Host pack with client configs created:${BR}${CLIENT_PACKS_DIR}/${HOST_NAME}.zip"
+    if ((CREATE_ZIP)); then
+        zip --exclude \*.zip -rjD "${CLIENT_PACKS_DIR}/${HOST_NAME}.zip" "${CLIENT_PACKS_DIR}/${HOST_NAME}/" >/dev/null
+        [[ "${VERB}" == default || "${VERB}" == debug ]] && \
+        echo "${BR}Host pack with client configs created:${BR}${CLIENT_PACKS_DIR}/${HOST_NAME}.zip"
+    fi
 }
 
 
@@ -760,122 +896,43 @@ find_client_names() {
     if [[ ${_var} ]]; then eval "${_var}=(\${_res[@]})"; else echo "${_res[@]}"; fi
 }
 
+
 BR=$'\n'
-
-read -rd '' USAGE <<'EOF'
-Usage:
-    openvpn-manage ACTION { PARAMS } [ OPTIONS ]
-    ACTION := { usage | help | create | append | enable | disable | revoke | list | show }
-    OPTIONS := { -f CONF | -t CLIENT_TYPE | -s IP/CIDR | -c COUNT | -o CLIENT_OS | -e | -d | -v }
-    CLIENT_TYPE := { user | router }
-    CLIENT_OS := { windows | nix }
-
-    openvpn-manage { create | append } HOST_NAME [ OPTIONS ]
-
-    openvpn-manage { enable | disable | revoke } { host HOST_NAME | client CLIENT_NAME }
-
-    openvpn-manage list { host[s] | client[s] } [ HOST_NAME ] { -t CLIENT_TYPE | -s CLIENT_SUBNET_BEHIND | -e | -d }
-
-    openvpn-manage show { host HOST_NAME | client CLIENT_NAME }
-EOF
-
-read -rd '' HELP <<EOF
-${USAGE}
-
-Description:
-    "host" is the name of specific host (specific host can have several clients/certs).
-    "client" is specific vpn-client/cert for the host.
-
-Actions:
-    create host HOST_NAME
-    append client HOST_NAME
-        Used for create/append clients to HOST_NAME.
-        Difference is:
-        validation - you can't create host if HOST_NAME already exist and you can't
-            append clients to non-existent host.
-        subnet applying for type router - for "append" if -s not specified additional clients of
-            the host will have the same subnet as first available iroute option
-            in first available client config.
-
-    enable, disable, revoke
-        You can enable/disable/revoke specific client (client CLIENT_NAME) or all clients
-        (host HOST_NAME) of the host.
-        Enable and disable just delete/add 'disable' line to client config, so client can't
-        connect. Host/client can be enabled/disabled any time.
-        revoke adds client[s] cert[s] to revocation list, so it could be treated as
-        persistent client deactivation.
-        Note: revoked cert still can be unrevoked manually, but it's not supported
-        by openvpn-manage.
-
-    list
-        List hosts or clients depends on filter options.
-        For HOST_NAME grep standard regexp's supported.
-        Examples:
-            List all hosts:
-                list hosts
-            List all routers clients:
-                list clients -t router
-            List enabled clients of specific host with specified internal subnet:
-                list clients HOST_NAME -e -s 10.10.0.8/29
-
-Options:
-    -f CONF
-        Configuration file of openvpn-manage
-        Default: /etc/openvpn/server/scripts/openvpn-manage.conf
-
-    -t CLIENT_TYPE
-        Could be "user" (default) or "router". Difference is client config options.
-        User config contain push "route ..." to the routers internal subnets.
-        Router config contain iroute to internal subnet behind it.
-
-    -s CLIENT_SUBNET_BEHIND
-        Format: IP/CIDR. Subnet behind the router. Valid only if CLIENT_TYPE is "router".
-        If no subnet specified subnet will be incremented from the last saved subnet.
-        Subnet will be saved to LAST_IROUTE_SUBNET_FILE. If no file exist
-        INITIAL_IROUTE_SUBNET will be used and then saved to LAST_IROUTE_SUBNET_FILE.
-        Subnet will be saved only if -s option omitted, so manually specified subnet
-        will not be saved in LAST_IROUTE_SUBNET_FILE. It's allow manually specify
-        subnet without interrupt existing subnet chain.
-
-    -c COUNT
-        Default is 1. Allow to create COUNT clients/certs for the host with single
-        command. Additional host clients/certs could be added via action "append"
-        next time.
-
-    -e, -d
-        List enabled/disabled only.
-
-    -v
-        Verbose output.
-EOF
 
 
 # Main case: Parse positional arguments
 case "$1" in
-    ''|usage) quit 255 "${USAGE}"; ;;
-
-    help) quit 255 "${HELP}"; ;;
+    ''|help) quit 255 "${HELP}";;
 
     *)  # Parse args, verify, apply defaults.
         # Really not for all actions root required, but to be sure...
         # ((UID)) && quit 2 'Root privileges required'
 
         [[ $2 ]] || quit 1 "Action requires parameter!"
-        unset HELP USAGE
+        unset HELP
 
         ## Defaults
         DESCRIPTOR=/dev/null  # Default if no -v option specified
         CONF='/etc/openvpn/server/scripts/openvpn-manage.conf'
+        CREATE_ZIP=0  # Do not create zip archives
 
         # Options below can be overwrited in CONF file
-        CA_PASS=no  # 'yes' if CA is password protected
+        # CA_PASS=no  # 'yes' if CA is password protected
         SERVER_DIR='/etc/openvpn/server'
         KEYS_DIR="${SERVER_DIR}/keys"
         CLIENT_KEYS_DIR="${SERVER_DIR}/client-keys"
         CLIENT_PACKS_DIR="${SERVER_DIR}/client-packs"
         CLIENT_CONFIG_DIR="${SERVER_DIR}/client-configs"
         USERS_CONF="${SERVER_DIR}/users-config"
-        SERVER_CONF="${SERVER_DIR}/server.conf"  # If tcp and udp servers subnet are the same, any config is fine here
+        UDP_SERVER_CONF='/etc/openvpn/udp.server.conf'
+        TCP_SERVER_CONF='/etc/openvpn/tcp.server.conf'
+        if [[ -f "${UDP_SERVER_CONF}" ]]; then
+            SERVER_CONF="${UDP_SERVER_CONF}"
+        elif [[ -f "${TCP_SERVER_CONF}" ]]; then
+            SERVER_CONF="${TCP_SERVER_CONF}"
+        else
+            SERVER_CONF='/etc/openvpn/server.conf'
+        fi
         EASYRSA='/etc/openvpn/easy-rsa/easyrsa3'
         CLIENT_OS_DEFAULT='nix'  # 'nix' for Unix-based OS, 'windows' for Windows
         OPENVPN_USER=openvpn
@@ -894,16 +951,18 @@ case "$1" in
                 break
             fi
         done
-        while getopts ":vedt:o:s:c:f:" OPT; do
+        while getopts ":edt:o:s:c:f:v:z:r:" OPT; do
             [[ "${OPTARG::1}" = '-' ]] && quit 1 "Option argument can not start with '-'"
             case "$OPT" in
-                v) DESCRIPTOR=/dev/stdout; V='-v'; ;;
-                e) ENABLED=yes; E='-e'; ;;
-                d) ENABLED=no; D='-d'; ;;
-                t) CLIENT_TYPE=${OPTARG}; T='-t'; ;;
+                v) VERB=${OPTARG}; V='-v';
+                    [[ "${VERB}" == debug ]] && DESCRIPTOR=/dev/stdout
+                    ;;
+                e) ENABLED=yes; E='-e';;
+                d) ENABLED=no; D='-d';;
+                t) CLIENT_TYPE=${OPTARG}; T='-t';;
                 o) CLIENT_OS=${OPTARG}; O='-o';
                     case "${CLIENT_OS}" in
-                        linux|mac|bsd) CLIENT_OS=nix; ;;
+                        linux|mac|bsd) CLIENT_OS=nix;;
                         windows|nix) ;;
                         *) quit 1 "Invalid OS: ${CLIENT_OS}${BR}"'Have to be "windows" or "nix" (for Linux/Mac/BSD/etc). "linux", "mac", "bsd" translated to "nix".'
                     esac
@@ -911,18 +970,29 @@ case "$1" in
                 s) CLIENT_SUBNET_BEHIND=${OPTARG}; S='-s';
                     validate_ip4cidr "${CLIENT_SUBNET_BEHIND}" || quit 1 "Invalid subnet: ${CLIENT_SUBNET_BEHIND}"
                     ;;
-                c) COUNT=${OPTARG}; C='-c'; ;;
-                f) CONF=${OPTARG}; F='-f'; ;;
-                :) quit 1 "Option -$OPTARG requires an argument"; ;;
-                *) quit 1 "Invalid option: -$OPTARG"; ;;
+                c) COUNT=${OPTARG};;
+                f) CONF=${OPTARG};;
+                z) [[ "${OPTARG}" == 1 ]] && CREATE_ZIP=1 || CREATE_ZIP=0;;
+                r) REMOTE=${OPTARG}
+                    # It also could be domain, so
+                    # validate_ip4 "${REMOTE%%:*}" || quit 1 "Invalid IP on -r option value: ${REMOTE}"
+                    ;;
+                :) quit 1 "Option -$OPTARG requires an argument";;
+                *) quit 1 "Invalid option: -$OPTARG";;
             esac
         done
         # OPTIND=1
 
         # Import configuration file
         . "${CONF}"
-        (($?==0)) || quit 1 "Failed to import configuration file: ${CONF}"
+        (($?)) && quit 1 "Failed to import configuration file: ${CONF}"
         # echo "${CLIENT_CONFIG_TEMPLATE}" >&2
+
+        # Set variables of for -r option
+        if [[ -n ${REMOTE} ]]; then
+            [[ ${REMOTE%%:*} ]] && REMOTE_IP=${REMOTE%%:*}
+            [[ ${REMOTE##*:} =~ ^[0-9]+$ ]] && REMOTE_PORT=${REMOTE##*:}
+        fi
 
         CHROOT=$(exec -c grep -m1 '^chroot ' "${SERVER_CONF}")
         CHROOT=${CHROOT#chroot }
@@ -954,9 +1024,9 @@ case "$1" in
         fi
 
         case "${CLIENT_TYPE}" in
-            '') CLIENT_TYPE=user; ;;
+            '') CLIENT_TYPE=user;;
             user|router) ;;
-            *) quit 1 "Invalid argument for -t option: ${CLIENT_TYPE}"; ;;
+            *) quit 1 "Invalid argument for -t option: ${CLIENT_TYPE}";;
         esac
 
         if [[ -n "${S}" && "${CLIENT_TYPE}" != router ]]; then
@@ -964,9 +1034,57 @@ case "$1" in
         fi
 
         case "${COUNT}" in
-            '') COUNT=1; ;;
-            *[^0-9]*) quit 1 "Invalid COUNT: ${COUNT}"; ;;
+            '') COUNT=1;;
+            *[^0-9]*) quit 1 "Invalid COUNT: ${COUNT}";;
         esac
+
+        # Set openvpn management interface variables
+        UDP_MANAGEMENT_SOCKET=''
+        UDP_MANAGEMENT_IP=''
+        UDP_MANAGEMENT_PORT=''
+        UDP_MANAGEMENT_PWFILE=''
+        UDP_MANAGEMENT_USER='root'
+        UDP_MANAGEMENT_GROUP='root'
+        if [[ -f "${UDP_SERVER_CONF}" ]]; then
+            while read -a cflarr || [[ -n "${cflarr}" ]]; do
+                if [[ "${cflarr[0]}" == 'management' ]]; then
+                    UDP_MANAGEMENT_PWFILE=${cflarr[3]}
+                    if [[ "${cflarr[2]}" == unix ]]; then
+                        UDP_MANAGEMENT_SOCKET=${cflarr[1]}
+                    else
+                        UDP_MANAGEMENT_IP=${cflarr[1]}
+                        UDP_MANAGEMENT_PORT=${cflarr[2]}
+                    fi
+                elif [[ "${cflarr[0]}" == 'management-client-user' ]]; then
+                    UDP_MANAGEMENT_USER=${cflarr[1]}
+                elif [[ "${cflarr[0]}" == 'management-client-group' ]]; then
+                    UDP_MANAGEMENT_GROUP=${cflarr[1]}
+                fi
+            done <"${UDP_SERVER_CONF}"
+        fi
+        TCP_MANAGEMENT_SOCKET=''
+        TCP_MANAGEMENT_IP=''
+        TCP_MANAGEMENT_PORT=''
+        TCP_MANAGEMENT_PWFILE=''
+        TCP_MANAGEMENT_USER='root'
+        TCP_MANAGEMENT_GROUP='root'
+        if [[ -f "${TCP_SERVER_CONF}" ]]; then
+            while read -a cflarr || [[ -n "${cflarr}" ]]; do
+                if [[ "${cflarr[0]}" == 'management' ]]; then
+                    TCP_MANAGEMENT_PWFILE=${cflarr[3]}
+                    if [[ "${cflarr[2]}" == unix ]]; then
+                        TCP_MANAGEMENT_SOCKET=${cflarr[1]}
+                    else
+                        TCP_MANAGEMENT_IP=${cflarr[1]}
+                        TCP_MANAGEMENT_PORT=${cflarr[2]}
+                    fi
+                elif [[ "${cflarr[0]}" == 'management-client-user' ]]; then
+                    TCP_MANAGEMENT_USER=${cflarr[1]}
+                elif [[ "${cflarr[0]}" == 'management-client-group' ]]; then
+                    TCP_MANAGEMENT_GROUP=${cflarr[1]}
+                fi
+            done <"${TCP_SERVER_CONF}"
+        fi
         ;;&
 
     create)
@@ -1085,8 +1203,11 @@ case "$1" in
                 echo "${BR}All certs of ${HOST_NAME} was revoked"
                 ;;
         esac
-        ./easyrsa --batch gen-crl &>"${DESCRIPTOR}" && echo "Revocation list was updated" \
-                                                || quit 1 "Failed to update revocation list!"
+        if ./easyrsa --batch gen-crl &>"${DESCRIPTOR}"; then
+            echo "Revocation list was updated"
+        else
+            quit 1 "Failed to update revocation list!"
+        fi
         chown :"${OPENVPN_GROUP}" "${EASYRSA}/pki/crl.pem"
         chmod 440 "${EASYRSA}/pki/crl.pem"
         if [[ -d /etc/openvpn/chroot ]]; then
@@ -1118,13 +1239,13 @@ case "$1" in
             clients|client)
                 OUT=$(ls -1 "${CLIENT_CONFIG_DIR}" | grep -v '^DEFAULT$')  # All clients/certs
                 if [[ -z $3 ]]; then
-                    [[ ${OUT} ]] && echo "${OUT}" || quit 1 "No clients match!"
+                    if [[ -n "${OUT}" ]]; then echo "${OUT}"; else quit 1 "No clients match!"; fi
                     exit 0
                 elif [[ "${3::1}" != '-' ]]; then
                     # Filter by HOST_NAME
                     HOST_NAME=$3
                     OUT=$(exec -c grep "^[[:digit:]]*-${HOST_NAME}$" <<<"${OUT}")
-                    [[ ${OUT} ]] || quit 1 "No clients match!"
+                    [[ -n "${OUT}" ]] || quit 1 "No clients match!"
                     # [[ -d "${CLIENT_PACKS_DIR}/${HOST_NAME}" ]] || quit 1 "No such host: ${HOST_NAME}"
                     # ls -1 "${CLIENT_CONFIG_DIR}" | grep "^[[:digit:]]*-${HOST_NAME}$"
                     # find "${CLIENT_CONFIG_DIR}" -maxdepth 1 -mindepth 1 -type f -name "[0-9]+-$3" -printf "%f\n"  | awk -F / '{print $NF}' | cut -d- -f2- | sort -u
@@ -1165,18 +1286,18 @@ case "$1" in
                 #     # Can be manually changed by user, so skip implementing this filter.
                 # fi
 
-                [[ ${OUT} ]] && echo "${OUT}" || quit 1 "No clients match!"
+                if [[ -n "${OUT}" ]]; then echo "${OUT}"; else quit 1 "No clients match!"; fi
                 ;;
             hosts|host)
                 OUT=$(ls -1 "${CLIENT_CONFIG_DIR}" | grep -v '^DEFAULT$' | cut -d- -f2- | sort -u)  # All hosts
                 if [[ -z $3 ]]; then
-                    [[ ${OUT} ]] && echo "${OUT}" || quit 1 "No hosts match!"
+                    if [[ -n "${OUT}" ]]; then echo "${OUT}"; else quit 1 "No hosts match!"; fi
                     exit 0
                 elif [[ "${3::1}" != '-' ]]; then
                     # Filter by HOST_NAME
                     HOST_NAME=$3
                     OUT=$(exec -c grep "^${HOST_NAME}$" <<<"${OUT}")
-                    [[ ${OUT} ]] || quit 1 "No hosts match!"
+                    [[ -n "${OUT}" ]] || quit 1 "No hosts match!"
                 fi
 
                 # Filter by options
@@ -1210,7 +1331,11 @@ case "$1" in
                     quit 254 "-s filter for hosts is not implemented yet"
                 fi
 
-                [[ ${OUT} ]] && echo "${OUT}" || quit 1 "No hosts match!"
+                if [[ -n "${OUT}" ]]; then
+                    echo "${OUT}"
+                else
+                    quit 1 "No hosts match!"
+                fi
                 ;;
             *) quit 1 "Invalid parameter: $2"
         esac
@@ -1228,13 +1353,104 @@ case "$1" in
         esac
         ;;
 
+    rename)  ## Dirty hack
+        OLD_HOST_NAME=$2
+        HOST_NAME=$3
+        [[ -n  ${HOST_NAME} && -n ${OLD_HOST_NAME} ]] || quit 1 "You have to specify source and destination hostname"
+        validate_host_name "${HOST_NAME}"
+        if ! [[ -d "${CLIENT_PACKS_DIR}/${OLD_HOST_NAME}" ]]; then
+            quit 1 "Source host does not exist: ${OLD_HOST_NAME}"
+        fi
+        if [[ -d "${CLIENT_PACKS_DIR}/${HOST_NAME}" ]]; then
+            quit 1 "Destination host already exist: ${HOST_NAME}"
+        fi
+
+        read -r N_HEX CN <<<$(grep -m1 -E "/CN=[0-9]{5}-${OLD_HOST_NAME}/" "${EASYRSA}/pki/index.txt" | cut -d$'\t' -f4,6)
+        CN=${CN##*/CN=}; CN=${CN%%-*}-${OLD_HOST_NAME}
+        FLN=${CN%%-*}
+
+        OLD_USER=${CN}
+        USER=${FLN}-${HOST_NAME}
+
+        # Create user in cloned dir
+        mkdir -p /tmp/openvpn-manage/$$
+        cp -ra "${EASYRSA}" /tmp/openvpn-manage/$$
+        cd "/tmp/openvpn-manage/$$/${EASYRSA##*/}"
+        sed -i 's|/etc/openvpn/easy-rsa/easyrsa3|"$PWD"|g' vars
+        ./easyrsa --batch --req-cn="${USER}" gen-req "${USER}" nopass &>"${DESCRIPTOR}" || quit 1 "Easyrsa error: $?"
+        ./easyrsa --batch --req-cn="${USER}" sign-req client "${USER}" &>"${DESCRIPTOR}" || quit 1 "Easyrsa error: $?"
+        # Change CN in Authority Key Identifier DirName for compatibility with Netcomm routers openvpn interface
+        sed -i -e "s|/CN=server/|/CN=${USER}/|" -e "s|/CN=server$|/CN=${USER}|" "pki/issued/${USER}.crt"
+
+        ## Applying changes to original folder
+        # Replace key, req, crt
+        mv "pki/private/${USER}.key" "${EASYRSA}/pki/private/"
+        mv "pki/reqs/${USER}.req" "${EASYRSA}/pki/reqs/"
+        mv "pki/issued/${USER}.crt" "${EASYRSA}/pki/issued/"
+        rm -f "${EASYRSA}/pki/private/${OLD_USER}.key" \
+              "${EASYRSA}/pki/reqs/${OLD_USER}.req" \
+              "${EASYRSA}/pki/issued/${OLD_USER}.crt"
+        # Change certs_by_serial
+        mv "$(exec -c grep -m1 -l "CN=${USER}" ./pki/certs_by_serial/*.pem)" "${EASYRSA}/pki/certs_by_serial/${N_HEX}.pem"
+        # Change index.txt
+        sed -i "s|^$(exec -c grep -m1 "CN=${OLD_USER}" "${EASYRSA}/pki/index.txt")|$(grep -m1 "CN=${USER}" "pki/index.txt" | sed "s|\t15\tunknown|\t${N_HEX}\tunknown|")|" "${EASYRSA}/pki/index.txt"
+        # Rename files/folders
+        mv /etc/openvpn/server/client-packs/{${OLD_HOST_NAME},${HOST_NAME}} &&
+        mv /etc/openvpn/server/client-packs/${HOST_NAME}/{${OLD_USER},${USER}}.conf
+        mv /etc/openvpn/server/client-keys/{${OLD_USER},${USER}}.key
+        mv /etc/openvpn/server/client-keys/{${OLD_USER},${USER}}.crt
+        mv /etc/openvpn/chroot/ccd/{${OLD_USER},${USER}}
+        # Change client config
+        read -rd '' USER_CONFIG <<EOFUSER_CONFIG
+$(exec -c sed \
+    -e "s|for host \"${OLD_HOST_NAME}\"|for host \"${HOST_NAME}\"|" \
+    -e "s|^remote [^ ]\+ [0-9]\+|remote ${REMOTE_IP} ${REMOTE_PORT}|g" \
+    -e '/^<cert>$/,$d' \
+    "/etc/openvpn/server/client-packs/${HOST_NAME}/${USER}.conf")
+<cert>
+$(< "${EASYRSA}/pki/issued/${USER}.crt")
+</cert>
+<key>
+$(< "${EASYRSA}/pki/private/${USER}.key")
+</key>
+key-direction 1
+<tls-auth>
+$(< "${SERVER_DIR}/keys/ta.key")
+</tls-auth>
+EOFUSER_CONFIG
+        echo "${USER_CONFIG}" >"/etc/openvpn/server/client-packs/${HOST_NAME}/${USER}.conf"
+        chown -R :sudo "/etc/openvpn/server/client-packs/${HOST_NAME}"
+
+        cd - >/dev/null
+        rm -rf /tmp/openvpn-manage/$$
+
+        if "${EASYRSA}/easyrsa" --batch gen-crl &>"${DESCRIPTOR}"; then
+            echo "Revocation list was updated"
+        else
+            quit 1 "Failed to update revocation list!"
+        fi
+        chown :"${OPENVPN_GROUP}" "${EASYRSA}/pki/crl.pem"
+        chmod 440 "${EASYRSA}/pki/crl.pem"
+
+        if [[ "${VERB}" == conf ]]; then
+            echo "${USER_CONFIG}"
+        elif [[ "${VERB}" == none ]]; then
+            :
+        else
+            echo "Host renamed: ${OLD_HOST_NAME} -> ${HOST_NAME}"
+            echo "Now you have to use updated user config because certs was changed: /etc/openvpn/server/client-packs/${HOST_NAME}/${USER}.conf"
+        fi
+        # quit 1 "This action is not implemented yet."
+        ;;
+
+    version|--version) quit 255 "${SCRIPT_VERSION}";;
+
     *)                                                                                                                                                                                                                 EE=${BR}${BR}'But don'$'\'''t be upset! Pet the croco and go ahead to eat some cookies!'$'\n'; KOTEHOK=$'\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x5f\x5f\x2e\x2e\x2d\x2d\x27\x27\x60\x60\x2d\x2d\x2d\x2e\x2e\x2e\x2e\x5f\x5f\x5f\x20\x20\x20\x5f\x2e\x2e\x2e\x5f\x20\x20\x20\x20\x5f\x5f\x0a\x2f\x2f\x2f\x20\x2f\x2f\x5f\x2e\x2d\x27\x20\x20\x20\x20\x2e\x2d\x2f\x22\x3b\x20\x20\x60\x20\x20\x20\x20\x20\x20\x20\x20\x60\x60\x3c\x2e\x5f\x20\x20\x60\x60\x2e\x27\x27\x5f\x20\x60\x2e\x20\x2f\x20\x2f\x2f\x20\x2f\x0a\x2f\x2f\x2f\x5f\x2e\x2d\x27\x20\x5f\x2e\x2e\x2d\x2d\x2e\x27\x5f\x20\x20\x20\x20\x5c\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x60\x28\x20\x29\x20\x29\x20\x2f\x2f\x20\x2f\x2f\x0a\x2f\x20\x28\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x20\x28\x3c\x20\x5f\x20\x20\x20\x20\x20\x3b\x5f\x2e\x2e\x5f\x5f\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x3b\x20\x60\x27\x20\x2f\x20\x2f\x2f\x2f\x0a\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x20\x60\x2d\x2e\x5f\x2c\x5f\x29\x27\x20\x2f\x2f\x20\x2f\x20\x60\x60\x2d\x2d\x2e\x2e\x2e\x5f\x5f\x5f\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x2f\x20\x2f\x20\x2f\x2f\x27\x0a'; HEKOTEHOK=$'\x20\x20\x20\x20\x20\x20\x5f\x3d\x2c\x5f\x0a\x20\x20\x20\x6f\x5f\x2f\x36\x20\x2f\x23\x20\x20\x20\x5c\x5f\x5f\x20\x7c\x23\x23\x2f\x0a\x20\x20\x20\x20\x3d\x27\x7c\x2d\x2d\x20\x20\x20\x20\x20\x20\x2f\x20\x20\x20\x23\x27\x2d\x2e\x0a\x20\x20\x20\x20\x20\x20\x5c\x23\x7c\x5f\x20\x20\x20\x5f\x27\x2d\x2e\x20\x2f\x0a\x20\x20\x20\x20\x20\x20\x20\x7c\x2f\x20\x5c\x5f\x28\x20\x23\x20\x7c\x22\x0a\x20\x20\x20\x20\x20\x20\x43\x2f\x20\x2c\x2d\x2d\x5f\x5f\x5f\x2f\x0a'; if ((1$(exec -c date +%N)%2)); then EE+=${KOTEHOK}; else EE+=${HEKOTEHOK}; fi  # Easter egg =)
         quit 1 "This action is not implemented yet.${EE}"
         ;;
 esac
 
 exit 0
-
 EOF_OPENVPN_MANAGE
 echo "${OPENVPN_MANAGE}" >'/etc/openvpn/server/scripts/openvpn-manage'
 
@@ -1340,7 +1556,9 @@ read -rd '' OPENVPN_MANAGE_CONF <<EOF_OPENVPN_MANAGE_CONF
 # CLIENT_CONFIG_DIR="\${SERVER_DIR}/client-configs"
 CLIENT_CONFIG_DIR='/etc/openvpn/chroot/ccd'
 # USERS_CONF="\${SERVER_DIR}/users-config"
-SERVER_CONF='/etc/openvpn/udp.server.conf'  # If tcp and udp servers subnet are the same, any config is fine here
+UDP_SERVER_CONF='/etc/openvpn/udp.server.conf'
+TCP_SERVER_CONF='/etc/openvpn/tcp.server.conf'
+SERVER_CONF=${UDP_SERVER_CONF}  # If tcp and udp servers subnet are the same, any config is fine here, othervise set the main one.
 # EASYRSA='/etc/openvpn/easy-rsa/easyrsa3'
 CLIENT_OS_DEFAULT='windows'  # 'nix' for Unix-based OS, 'windows' for Windows
 # OPENVPN_USER=openvpn
