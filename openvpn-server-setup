@@ -25,254 +25,7 @@ SERVER_LOCAL_IF='eth0'
 link_mtu=';link-mtu'
 mssfix='mssfix'
 
-
-##
-# Exit with optional message to stderr
-##
-quit() {
-    [[ $2 ]] && echo "$2" >&2
-    exit "${1:-0}"
-}
-
-
-##
-# Validate IPv4 address
-# Note: this is invalid address: 192.168.000.001
-##
-validate_ip4() {
-    local _re
-    _re='^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$'
-    [[ "$1" =~ ${_re} ]] && return 0 || return 1
-}
-
-
-((UID)) && quit 1 "You are not root. Try: sudo $0 $*"
-BR=$'\n'  # Newline alias
-
-
-## Decide which way preferred: mssfix or link-mtu
-if [[ ${1::1} == '-' ]]; then  # First arg is an option
-    opt=${1#${1%%[^-]*}}  # Remove leading hyphens
-    if [[ "${opt}" == 'mssfix' ]]; then
-        link_mtu=';link-mtu'
-        mssfix='mssfix'
-    elif [[ "${opt}" == 'link-mtu' ]]; then
-        link_mtu='link-mtu'
-        mssfix=';mssfix'
-    else
-        quit 1 "Invalid option: $1"
-    fi
-fi
-
-## Check OS
-if [[ -f /etc/redhat-release ]]; then
-    OS_family=RedHat
-
-    ## Get CentOS major version
-    CentOS_major=$(exec -c sed -n 's/.* \([0-9]\+\)\.\?.*/\1/p' /etc/redhat-release)
-
-    if ! ((CentOS_major == 6 || CentOS_major == 7)); then
-        quit 1 'Only CentOS 6 & 7 supported for RedHat family, check your CentOS version in /etc/redhat-release'
-    fi
-    echo "CentOS major version detected: ${CentOS_major}"
-
-    OS=CentOS
-
-    ## You could want to upgrade the system to latest state if it's created from scratch
-    # yum -y -d0 upgrade
-
-    case "${CentOS_major}" in
-        7)
-            echo 'Adding epel repo'
-            rpm -ivh --replacepkgs "http://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm"
-            (($?==0)) || quit 1 'Failed to add epel repo'
-
-            echo 'Disable and stop firewalld if exists'
-            systemctl disable firewalld
-            systemctl stop firewalld
-            echo 'Install, start and enable iptables-services'
-            yum -y -d0 install iptables-services
-            systemctl enable iptables
-            systemctl start iptables
-            ;;
-        6)
-            echo 'Fix ancient ca-certs'
-            yum --disablerepo=epel -y -d1 update ca-certificates
-
-            echo 'Adding epel repo'
-            rpm -ivh --replacepkgs "http://dl.fedoraproject.org/pub/epel/epel-release-latest-6.noarch.rpm"
-            (($?==0)) || quit 1 'Failed to install epel repo'
-            # echo 'Changing epel repo to use http instead of https because of ancient ca-certs'
-            # sed -i 's|https://|http://|g' /etc/yum.repos.d/epel*.repo
-            ;;
-    esac
-    (($?==0)) || quit 1 'Failed to install epel repo'
-elif [[ -f /etc/debian_version ]]; then
-    OS_family=Debian
-    if grep -q ' xenial ' /etc/apt/sources.list; then
-        OS=Ubuntu
-        OS_release=Xenial
-    # elif grep -q ' stretch ' /etc/apt/sources.list; then
-    #     OS=Debian
-    #     OS_release=Stretch
-    else
-        quit 1 'Only Ubuntu Xenial 16.04 supported for Debian family'
-    fi
-else
-    quit 1 'Unsupported OS family'
-fi
-
-
-case "${OS_family}" in
-    RedHat)
-        echo 'Installing required packages'
-        yum -y -d0 install openvpn zip unzip iptables iproute bind-utils wget openssl netcat-openbsd
-        (($?==0)) || quit 1 'Failed to install required packages'
-        ;;
-    Debian)
-        if [[ "${OS_release}" != Stretch ]]; then
-            echo 'Add official openvpn repo'  # See https://community.openvpn.net/openvpn/wiki/OpenvpnSoftwareRepos
-            wget -nv -O - https://swupdate.openvpn.net/repos/repo-public.gpg | apt-key add -
-            echo "deb http://build.openvpn.net/debian/openvpn/stable ${OS_release,,} main" >/etc/apt/sources.list.d/openvpn-aptrepo.list
-        fi
-        echo 'Updating packages list'
-        apt-get -yqq update
-        echo 'Installing required packages'
-        apt-get -yq install openvpn zip unzip iptables iproute2 wget dnsutils openssl netfilter-persistent netcat-openbsd
-        ;;
-esac
-(($?==0)) || quit 1 'Failed to install required packages'
-
-echo 'Check openvpn version (should be >=2.4)'
-openvpn --version | head -1
-(($?==0)) || quit 1 'Failed to check openvpn version'
-
-SERVER_LOCAL_IP=$(ip address show "${SERVER_LOCAL_IF}" | sed -n 's/ \+inet \([0-9.]\+\).*/\1/p' 2>/dev/null | grep -v 127.0.0.1 | head -1)
-echo 'Existing host IPv4 non-local interfaces:'
-# hostname -I
-ip -o -4 address | grep -v -e ': lo ' -e ': tun[0-9]\+ ' -e ': tap[0-9]\+ '
-if [[ -z ${SERVER_LOCAL_IP} ]]; then
-    echo "Cannot detect local IP for ${SERVER_LOCAL_IF} interface."
-    echo -n "Input local IP for desired interface and press enter: "
-    read SERVER_LOCAL_IP
-    if ! grep -q " inet ${SERVER_LOCAL_IP}/" < <(exec -c ip -o -4 address); then
-        quit 1 "No such local IP assigned to any interface: ${SERVER_LOCAL_IP}"
-    fi
-    SERVER_LOCAL_IF=$(ifconfig | grep -B1 "inet addr:${SERVER_LOCAL_IP}" | awk '$1!="inet" && $1!="--" {print $1}' | cut -d: -f1)
-fi
-echo "Server local interface name: ${SERVER_LOCAL_IF}"
-echo "Server local IP for openvpn server: ${SERVER_LOCAL_IP}"
-# Server public IP or domain
-SERVER_PUBLIC_IP=$(dig -4 -b "${SERVER_LOCAL_IP}" +short +time=3 +retry=1 myip.opendns.com @208.67.222.222)
-if ! validate_ip4 "${SERVER_PUBLIC_IP}"; then
-    echo "Cannot detect public IP of interface ${SERVER_LOCAL_IF}"
-    echo -n 'Input interface name: '
-    read SERVER_LOCAL_IF
-    if ! [[ -L "/sys/class/net/${SERVER_LOCAL_IF}" ]]; then
-        quit 1 "No such interface: ${SERVER_LOCAL_IF}"
-    fi
-    echo -n 'Input local IP: '
-    read SERVER_LOCAL_IP
-    if ! grep -q " inet ${SERVER_LOCAL_IP}/" < <(exec -c ip address); then
-        quit 1 "No such local IP assigned to any interface: ${SERVER_LOCAL_IP}"
-    fi
-    SERVER_PUBLIC_IP=$(dig -4 -b "${SERVER_LOCAL_IP}" +short +time=3 +retry=1 myip.opendns.com @208.67.222.222)
-    if ! validate_ip4 "${SERVER_PUBLIC_IP}"; then
-        echo -n "Cannot detect public IP of interface ${SERVER_LOCAL_IF}"
-        echo -n "Input public IP: "
-        read SERVER_PUBLIC_IP
-    fi
-else
-    echo "Server public IP detected: ${SERVER_PUBLIC_IP}"
-fi
-
-## Change work dir
-mkdir -p /etc/openvpn
-cd /etc/openvpn
-
-## Clear some dirs if any
-[[ -d /etc/openvpn/server ]]   && rm -rvf /etc/openvpn/server
-[[ -d /etc/openvpn/easy-rsa ]] && rm -rvf /etc/openvpn/easy-rsa
-[[ -d /etc/openvpn/chroot ]]   && rm -rvf /etc/openvpn/chroot
-
-echo 'Downloading easyrsa pack'
-wget -nv https://github.com/vmspike/openvpn-manage/raw/master/easyrsa3.zip  # Better to use your own link for this pack
-(($?==0)) || quit 1 'Failed to download easyrsa3.zip pack'
-## Alternatively if you have it locally, run from your PC (for Windows you can use MobaXterm or Putty):
-# scp ./easyrsa3.zip user@host:~/
-## And move to /etc/openvpn on server side:
-# mv ~user/easyrsa3.zip /etc/openvpn
-
-## Some actions to setup easyrsa
-unzip -q easyrsa3.zip
-(($?==0)) || quit 1 'Failed to unzip easyrsa3.zip pack'
-rm -f easyrsa3.zip
-mv easy-rsa-master easy-rsa
-cd /etc/openvpn/easy-rsa/easyrsa3
-./easyrsa --batch init-pki
-
-## Will ask for common name if no --batch specified
-## Example: Gabriel (default: Easy-RSA CA; batch default: ChangeMe)
-./easyrsa --batch build-ca nopass
-
-./easyrsa --batch gen-crl
-./easyrsa --batch gen-req server nopass
-./easyrsa --batch sign-req server server
-./easyrsa --batch gen-dh  # Can take few minutes depends on CPU
-
-## User openvpn already should be present but if not add it
-if ! getent passwd openvpn &>/dev/null; then
-    case "${OS_family}" in
-        RedHat)
-            adduser --system --no-create-home --home-dir /etc/openvpn --shell /sbin/nologin --gid openvpn
-            ;;
-        Debian)
-            adduser --system --no-create-home --home /nonexistent --disabled-login --group openvpn
-            ;;
-    esac
-fi
-
-mkdir -p /etc/openvpn/server/{client-configs,client-keys,client-packs,keys,scripts}
-openvpn --genkey --secret /etc/openvpn/easy-rsa/easyrsa3/pki/ta.key
-ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/ca.crt /etc/openvpn/server/keys/
-# ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem /etc/openvpn/server/keys/
-ln -s /etc/openvpn/chroot/crl.pem /etc/openvpn/server/keys/
-ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/dh.pem /etc/openvpn/server/keys/
-ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/issued/server.crt /etc/openvpn/server/keys/
-ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/private/server.key /etc/openvpn/server/keys/
-ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/ta.key /etc/openvpn/server/keys/ta.key
-mkdir -p /var/log/openvpn
-chown -R :openvpn /etc/openvpn/server/keys/ /var/log/openvpn /etc/openvpn/easy-rsa/easyrsa3/pki
-chmod 400 /etc/openvpn/easy-rsa/easyrsa3/pki/{ca.crt,dh.pem,issued/server.crt,private/server.key,ta.key}
-chmod 750 /etc/openvpn/server/keys
-chmod 710 /etc/openvpn/easy-rsa/easyrsa3/pki/
-chmod 440 /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem
-touch /etc/openvpn/server/{tcp,udp}.server.conf
-chown -R root:openvpn /var/log/openvpn
-chmod 755 /var/log/openvpn/
-ln -s ./server/tcp.server.conf /etc/openvpn/tcp.server.conf
-ln -s ./server/udp.server.conf /etc/openvpn/udp.server.conf
-
-## Preparations for openvpn-manage
-ln -s /etc/openvpn/server/scripts/openvpn-manage /usr/local/bin/  # So it will be available globally if /usr/localb/in in PATH environmental variable
-touch /etc/openvpn/server/users-config
-chown :openvpn /etc/openvpn/server/users-config
-chmod 640 /etc/openvpn/server/users-config
-
-## Preparations for chrooted environment
-mkdir -p /etc/openvpn/chroot/{ccd,tmp,scripts,bin,etc}
-chown root:openvpn /etc/openvpn/chroot/tmp
-chmod 775 /etc/openvpn/chroot/tmp
-cp -pf /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem /etc/openvpn/chroot/
-# ln -s /etc/openvpn/chroot/crl.pem /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem
-touch /etc/openvpn/chroot/scripts/learn-address
-chown root:openvpn /etc/openvpn/chroot/scripts/*
-chmod 754 /etc/openvpn/chroot/scripts/*
-mv /etc/openvpn/server/users-config /etc/openvpn/chroot/
-ln -s ../chroot/users-config /etc/openvpn/server/users-config
-
-## Copy openvpn-manage to /etc/openvpn/server/scripts/
-# wget -nv https://github.com/vmspike/openvpn-manage/raw/master/openvpn-manage -O /etc/openvpn/server/scripts/openvpn-manage
+## The content of openvpn-manage script
 read -rd '' OPENVPN_MANAGE <<'EOF_OPENVPN_MANAGE'
 #!/bin/bash
 
@@ -1445,13 +1198,261 @@ EOFUSER_CONFIG
 
     version|--version) quit 255 "${SCRIPT_VERSION}";;
 
-    *)                                                                                                                                                                                                                 EE=${BR}${BR}'But don'$'\'''t be upset! Pet the croco and go ahead to eat some cookies!'$'\n'; KOTEHOK=$'\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x5f\x5f\x2e\x2e\x2d\x2d\x27\x27\x60\x60\x2d\x2d\x2d\x2e\x2e\x2e\x2e\x5f\x5f\x5f\x20\x20\x20\x5f\x2e\x2e\x2e\x5f\x20\x20\x20\x20\x5f\x5f\x0a\x2f\x2f\x2f\x20\x2f\x2f\x5f\x2e\x2d\x27\x20\x20\x20\x20\x2e\x2d\x2f\x22\x3b\x20\x20\x60\x20\x20\x20\x20\x20\x20\x20\x20\x60\x60\x3c\x2e\x5f\x20\x20\x60\x60\x2e\x27\x27\x5f\x20\x60\x2e\x20\x2f\x20\x2f\x2f\x20\x2f\x0a\x2f\x2f\x2f\x5f\x2e\x2d\x27\x20\x5f\x2e\x2e\x2d\x2d\x2e\x27\x5f\x20\x20\x20\x20\x5c\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x60\x28\x20\x29\x20\x29\x20\x2f\x2f\x20\x2f\x2f\x0a\x2f\x20\x28\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x20\x28\x3c\x20\x5f\x20\x20\x20\x20\x20\x3b\x5f\x2e\x2e\x5f\x5f\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x3b\x20\x60\x27\x20\x2f\x20\x2f\x2f\x2f\x0a\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x20\x60\x2d\x2e\x5f\x2c\x5f\x29\x27\x20\x2f\x2f\x20\x2f\x20\x60\x60\x2d\x2d\x2e\x2e\x2e\x5f\x5f\x5f\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x2f\x20\x2f\x20\x2f\x2f\x27\x0a'; HEKOTEHOK=$'\x20\x20\x20\x20\x20\x20\x5f\x3d\x2c\x5f\x0a\x20\x20\x20\x6f\x5f\x2f\x36\x20\x2f\x23\x20\x20\x20\x5c\x5f\x5f\x20\x7c\x23\x23\x2f\x0a\x20\x20\x20\x20\x3d\x27\x7c\x2d\x2d\x20\x20\x20\x20\x20\x20\x2f\x20\x20\x20\x23\x27\x2d\x2e\x0a\x20\x20\x20\x20\x20\x20\x5c\x23\x7c\x5f\x20\x20\x20\x5f\x27\x2d\x2e\x20\x2f\x0a\x20\x20\x20\x20\x20\x20\x20\x7c\x2f\x20\x5c\x5f\x28\x20\x23\x20\x7c\x22\x0a\x20\x20\x20\x20\x20\x20\x43\x2f\x20\x2c\x2d\x2d\x5f\x5f\x5f\x2f\x0a'; if ((1$(exec -c date +%N)%2)); then EE+=${KOTEHOK}; else EE+=${HEKOTEHOK}; fi  # Easter egg =)
+    *)                                                                                                                                                                                                                 EE=${BR}${BR}'But don'$'\'''t be upset! Pet the croco and go ahead to eat some cookies!'$'\n'; KOTEHOK=$'\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x5f\x5f\x2e\x2e\x2d\x2d\x27\x27\x60\x60\x2d\x2d\x2d\x2e\x2e\x2e\x2e\x5f\x5f\x5f\x20\x20\x20\x5f\x2e\x2e\x2e\x5f\x20\x20\x20\x20\x5f\x5f\x0a\x2f\x2f\x2f\x20\x2f\x2f\x5f\x2e\x2d\x27\x20\x20\x20\x20\x2e\x2d\x2f\x22\x3b\x20\x20\x60\x20\x20\x20\x20\x20\x20\x20\x20\x60\x60\x3c\x2e\x5f\x20\x20\x60\x60\x2e\x27\x27\x5f\x20\x60\x2e\x20\x2f\x20\x2f\x2f\x20\x2f\x0a\x2f\x2f\x2f\x5f\x2e\x2d\x27\x20\x5f\x2e\x2e\x2d\x2d\x2e\x27\x5f\x20\x20\x20\x20\x5c\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x60\x28\x20\x29\x20\x29\x20\x2f\x2f\x20\x2f\x2f\x0a\x2f\x20\x28\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x20\x28\x3c\x20\x5f\x20\x20\x20\x20\x20\x3b\x5f\x2e\x2e\x5f\x5f\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x3b\x20\x60\x27\x20\x2f\x20\x2f\x2f\x2f\x0a\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x2f\x2f\x20\x20\x60\x2d\x2e\x5f\x2c\x5f\x29\x27\x20\x2f\x2f\x20\x2f\x20\x60\x60\x2d\x2d\x2e\x2e\x2e\x5f\x5f\x5f\x5f\x2e\x2e\x2d\x27\x20\x2f\x2f\x2f\x20\x2f\x20\x2f\x2f\x27\x0a'; HEKOTEHOK=$'\x20\x20\x20\x20\x20\x20\x5f\x3d\x2c\x5f\x0a\x20\x20\x20\x6f\x5f\x2f\x36\x20\x2f\x23\x20\x20\x20\x5c\x5f\x5f\x20\x7c\x23\x23\x2f\x0a\x20\x20\x20\x20\x3d\x27\x7c\x2d\x2d\x20\x20\x20\x20\x20\x20\x2f\x20\x20\x20\x23\x27\x2d\x2e\x0a\x20\x20\x20\x20\x20\x20\x5c\x23\x7c\x5f\x20\x20\x20\x5f\x27\x2d\x2e\x20\x2f\x0a\x20\x20\x20\x20\x20\x20\x20\x7c\x2f\x20\x5c\x5f\x28\x20\x23\x20\x7c\x22\x0a\x20\x20\x20\x20\x20\x20\x43\x2f\x20\x2c\x2d\x2d\x5f\x5f\x5f\x2f\x0a'; if ((1$(exec -c date +%N)%2)); then EE+=${KOTEHOK}; else EE+=${HEKOTEHOK}; fi  # Easter egg
         quit 1 "This action is not implemented yet.${EE}"
         ;;
 esac
 
 exit 0
 EOF_OPENVPN_MANAGE
+
+
+##
+# Exit with optional message to stderr
+##
+quit() {
+    [[ $2 ]] && echo "$2" >&2
+    exit "${1:-0}"
+}
+
+
+##
+# Validate IPv4 address
+# Note: this is invalid address: 192.168.000.001
+##
+validate_ip4() {
+    local _re
+    _re='^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$'
+    [[ "$1" =~ ${_re} ]] && return 0 || return 1
+}
+
+
+((UID)) && quit 1 "You are not root. Try: sudo $0 $*"
+BR=$'\n'  # Newline alias
+
+
+## Decide which way preferred: mssfix or link-mtu
+if [[ ${1::1} == '-' ]]; then  # First arg is an option
+    opt=${1#${1%%[^-]*}}  # Remove leading hyphens
+    if [[ "${opt}" == 'mssfix' ]]; then
+        link_mtu=';link-mtu'
+        mssfix='mssfix'
+    elif [[ "${opt}" == 'link-mtu' ]]; then
+        link_mtu='link-mtu'
+        mssfix=';mssfix'
+    else
+        quit 1 "Invalid option: $1"
+    fi
+fi
+
+## Check OS
+if [[ -f /etc/redhat-release ]]; then
+    OS_family=RedHat
+
+    ## Get CentOS major version
+    CentOS_major=$(exec -c sed -n 's/.* \([0-9]\+\)\.\?.*/\1/p' /etc/redhat-release)
+
+    if ! ((CentOS_major == 6 || CentOS_major == 7)); then
+        quit 1 'Only CentOS 6 & 7 supported for RedHat family, check your CentOS version in /etc/redhat-release'
+    fi
+    echo "CentOS major version detected: ${CentOS_major}"
+
+    OS=CentOS
+
+    ## You could want to upgrade the system to latest state if it's created from scratch
+    # yum -y -d0 upgrade
+
+    case "${CentOS_major}" in
+        7)
+            echo 'Adding epel repo'
+            rpm -ivh --replacepkgs "http://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm"
+            (($?==0)) || quit 1 'Failed to add epel repo'
+
+            echo 'Disable and stop firewalld if exists'
+            systemctl disable firewalld
+            systemctl stop firewalld
+            echo 'Install, start and enable iptables-services'
+            yum -y -d0 install iptables-services
+            systemctl enable iptables
+            systemctl start iptables
+            ;;
+        6)
+            echo 'Fix ancient ca-certs'
+            yum --disablerepo=epel -y -d1 update ca-certificates
+
+            echo 'Adding epel repo'
+            rpm -ivh --replacepkgs "http://dl.fedoraproject.org/pub/epel/epel-release-latest-6.noarch.rpm"
+            (($?==0)) || quit 1 'Failed to install epel repo'
+            # echo 'Changing epel repo to use http instead of https because of ancient ca-certs'
+            # sed -i 's|https://|http://|g' /etc/yum.repos.d/epel*.repo
+            ;;
+    esac
+    (($?==0)) || quit 1 'Failed to install epel repo'
+elif [[ -f /etc/debian_version ]]; then
+    OS_family=Debian
+    if grep -q ' xenial ' /etc/apt/sources.list; then
+        OS=Ubuntu
+        OS_release=Xenial
+    # elif grep -q ' stretch ' /etc/apt/sources.list; then
+    #     OS=Debian
+    #     OS_release=Stretch
+    else
+        quit 1 'Only Ubuntu Xenial 16.04 supported for Debian family'
+    fi
+else
+    quit 1 'Unsupported OS family'
+fi
+
+
+case "${OS_family}" in
+    RedHat)
+        echo 'Installing required packages'
+        yum -y -d0 install openvpn zip unzip iptables iproute bind-utils wget openssl netcat-openbsd
+        (($?==0)) || quit 1 'Failed to install required packages'
+        ;;
+    Debian)
+        if [[ "${OS_release}" != Stretch ]]; then
+            echo 'Add official openvpn repo'  # See https://community.openvpn.net/openvpn/wiki/OpenvpnSoftwareRepos
+            wget -nv -O - https://swupdate.openvpn.net/repos/repo-public.gpg | apt-key add -
+            echo "deb http://build.openvpn.net/debian/openvpn/stable ${OS_release,,} main" >/etc/apt/sources.list.d/openvpn-aptrepo.list
+        fi
+        echo 'Updating packages list'
+        apt-get -yqq update
+        echo 'Installing required packages'
+        apt-get -yq install openvpn zip unzip iptables iproute2 wget dnsutils openssl netfilter-persistent netcat-openbsd
+        ;;
+esac
+(($?==0)) || quit 1 'Failed to install required packages'
+
+echo 'Check openvpn version (should be >=2.4)'
+openvpn --version | head -1
+(($?==0)) || quit 1 'Failed to check openvpn version'
+
+SERVER_LOCAL_IP=$(ip address show "${SERVER_LOCAL_IF}" | sed -n 's/ \+inet \([0-9.]\+\).*/\1/p' 2>/dev/null | grep -v 127.0.0.1 | head -1)
+echo 'Existing host IPv4 non-local interfaces:'
+# hostname -I
+ip -o -4 address | grep -v -e ': lo ' -e ': tun[0-9]\+ ' -e ': tap[0-9]\+ '
+if [[ -z ${SERVER_LOCAL_IP} ]]; then
+    echo "Cannot detect local IP for ${SERVER_LOCAL_IF} interface."
+    echo -n "Input local IP for desired interface and press enter: "
+    read SERVER_LOCAL_IP
+    if ! grep -q " inet ${SERVER_LOCAL_IP}/" < <(exec -c ip -o -4 address); then
+        quit 1 "No such local IP assigned to any interface: ${SERVER_LOCAL_IP}"
+    fi
+    SERVER_LOCAL_IF=$(ifconfig | grep -B1 "inet addr:${SERVER_LOCAL_IP}" | awk '$1!="inet" && $1!="--" {print $1}' | cut -d: -f1)
+fi
+echo "Server local interface name: ${SERVER_LOCAL_IF}"
+echo "Server local IP for openvpn server: ${SERVER_LOCAL_IP}"
+# Server public IP or domain
+SERVER_PUBLIC_IP=$(dig -4 -b "${SERVER_LOCAL_IP}" +short +time=3 +retry=1 myip.opendns.com @208.67.222.222)
+if ! validate_ip4 "${SERVER_PUBLIC_IP}"; then
+    echo "Cannot detect public IP of interface ${SERVER_LOCAL_IF}"
+    echo -n 'Input interface name: '
+    read SERVER_LOCAL_IF
+    if ! [[ -L "/sys/class/net/${SERVER_LOCAL_IF}" ]]; then
+        quit 1 "No such interface: ${SERVER_LOCAL_IF}"
+    fi
+    echo -n 'Input local IP: '
+    read SERVER_LOCAL_IP
+    if ! grep -q " inet ${SERVER_LOCAL_IP}/" < <(exec -c ip address); then
+        quit 1 "No such local IP assigned to any interface: ${SERVER_LOCAL_IP}"
+    fi
+    SERVER_PUBLIC_IP=$(dig -4 -b "${SERVER_LOCAL_IP}" +short +time=3 +retry=1 myip.opendns.com @208.67.222.222)
+    if ! validate_ip4 "${SERVER_PUBLIC_IP}"; then
+        echo -n "Cannot detect public IP of interface ${SERVER_LOCAL_IF}"
+        echo -n "Input public IP: "
+        read SERVER_PUBLIC_IP
+    fi
+else
+    echo "Server public IP detected: ${SERVER_PUBLIC_IP}"
+fi
+
+## Change work dir
+mkdir -p /etc/openvpn
+cd /etc/openvpn
+
+## Clear some dirs if any
+[[ -d /etc/openvpn/server ]]   && rm -rvf /etc/openvpn/server
+[[ -d /etc/openvpn/easy-rsa ]] && rm -rvf /etc/openvpn/easy-rsa
+[[ -d /etc/openvpn/chroot ]]   && rm -rvf /etc/openvpn/chroot
+
+echo 'Downloading easyrsa pack'
+wget -nv https://github.com/vmspike/openvpn-manage/raw/master/easyrsa3.zip  # Better to use your own link for this pack
+(($?==0)) || quit 1 'Failed to download easyrsa3.zip pack'
+## Alternatively if you have it locally, run from your PC (for Windows you can use MobaXterm or Putty):
+# scp ./easyrsa3.zip user@host:~/
+## And move to /etc/openvpn on server side:
+# mv ~user/easyrsa3.zip /etc/openvpn
+
+## Some actions to setup easyrsa
+unzip -q easyrsa3.zip
+(($?==0)) || quit 1 'Failed to unzip easyrsa3.zip pack'
+rm -f easyrsa3.zip
+mv easy-rsa-master easy-rsa
+cd /etc/openvpn/easy-rsa/easyrsa3
+./easyrsa --batch init-pki
+
+## Will ask for common name if no --batch specified
+## Example: Gabriel (default: Easy-RSA CA; batch default: ChangeMe)
+./easyrsa --batch build-ca nopass
+
+./easyrsa --batch gen-crl
+./easyrsa --batch gen-req server nopass
+./easyrsa --batch sign-req server server
+./easyrsa --batch gen-dh  # Can take few minutes depends on CPU
+
+## User openvpn already should be present but if not add it
+if ! getent passwd openvpn &>/dev/null; then
+    case "${OS_family}" in
+        RedHat)
+            adduser --system --no-create-home --home-dir /etc/openvpn --shell /sbin/nologin --gid openvpn
+            ;;
+        Debian)
+            adduser --system --no-create-home --home /nonexistent --disabled-login --group openvpn
+            ;;
+    esac
+fi
+
+mkdir -p /etc/openvpn/server/{client-configs,client-keys,client-packs,keys,scripts}
+openvpn --genkey --secret /etc/openvpn/easy-rsa/easyrsa3/pki/ta.key
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/ca.crt /etc/openvpn/server/keys/
+# ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem /etc/openvpn/server/keys/
+ln -s /etc/openvpn/chroot/crl.pem /etc/openvpn/server/keys/
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/dh.pem /etc/openvpn/server/keys/
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/issued/server.crt /etc/openvpn/server/keys/
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/private/server.key /etc/openvpn/server/keys/
+ln -s /etc/openvpn/easy-rsa/easyrsa3/pki/ta.key /etc/openvpn/server/keys/ta.key
+mkdir -p /var/log/openvpn
+chown -R :openvpn /etc/openvpn/server/keys/ /var/log/openvpn /etc/openvpn/easy-rsa/easyrsa3/pki
+chmod 400 /etc/openvpn/easy-rsa/easyrsa3/pki/{ca.crt,dh.pem,issued/server.crt,private/server.key,ta.key}
+chmod 750 /etc/openvpn/server/keys
+chmod 710 /etc/openvpn/easy-rsa/easyrsa3/pki/
+chmod 440 /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem
+touch /etc/openvpn/server/{tcp,udp}.server.conf
+chown -R root:openvpn /var/log/openvpn
+chmod 755 /var/log/openvpn/
+ln -s ./server/tcp.server.conf /etc/openvpn/tcp.server.conf
+ln -s ./server/udp.server.conf /etc/openvpn/udp.server.conf
+
+## Preparations for openvpn-manage
+ln -s /etc/openvpn/server/scripts/openvpn-manage /usr/local/bin/  # So it will be available globally if /usr/localb/in in PATH environmental variable
+touch /etc/openvpn/server/users-config
+chown :openvpn /etc/openvpn/server/users-config
+chmod 640 /etc/openvpn/server/users-config
+
+## Preparations for chrooted environment
+mkdir -p /etc/openvpn/chroot/{ccd,tmp,scripts,bin,etc}
+chown root:openvpn /etc/openvpn/chroot/tmp
+chmod 775 /etc/openvpn/chroot/tmp
+cp -pf /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem /etc/openvpn/chroot/
+# ln -s /etc/openvpn/chroot/crl.pem /etc/openvpn/easy-rsa/easyrsa3/pki/crl.pem
+touch /etc/openvpn/chroot/scripts/learn-address
+chown root:openvpn /etc/openvpn/chroot/scripts/*
+chmod 754 /etc/openvpn/chroot/scripts/*
+mv /etc/openvpn/server/users-config /etc/openvpn/chroot/
+ln -s ../chroot/users-config /etc/openvpn/server/users-config
+
+## Write openvpn-manage
 echo "${OPENVPN_MANAGE}" >'/etc/openvpn/server/scripts/openvpn-manage'
 
 chmod +x /etc/openvpn/server/scripts/openvpn-manage
@@ -1614,7 +1615,7 @@ client
 dev tun
 cipher AES-256-GCM
 auth SHA256
-comp-lzo
+;comp-lzo
 resolv-retry infinite
 remote-cert-tls server
 sndbuf 0
@@ -1812,8 +1813,9 @@ persist-local-ip
 
 # For uncompressable data (images, media) or high bandwidth better to use "comp-lzo no"
 # For other cases "adaptive" or "yes"
-comp-lzo adaptive
-push "comp-lzo adaptive"
+# comp-lzo is removed in openvpn >= 2.5
+;comp-lzo adaptive
+;push "comp-lzo adaptive"
 
 # For additional options see /etc/openvpn/server/users-config
 # and per client configs in client-config-dir
@@ -1921,7 +1923,7 @@ cipher AES-256-GCM
 auth SHA256
 tls-cipher TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256:TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256:TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384:TLS-DHE-RSA-WITH-AES-256-CBC-SHA256:TLS-DHE-RSA-WITH-AES-256-GCM-SHA384
 tls-version-min 1.2
-;opt-verify
+opt-verify
 
 ;script-security 1
 script-security 2
@@ -1942,8 +1944,9 @@ persist-local-ip
 
 # For uncompressable data (images, media) or high bandwidth better to use "comp-lzo no"
 # For other cases "adaptive" or "yes"
-comp-lzo adaptive
-push "comp-lzo adaptive"
+# comp-lzo is removed in openvpn >= 2.5
+;comp-lzo adaptive
+;push "comp-lzo adaptive"
 
 # For additional options see /etc/openvpn/server/users-config
 # and per client configs in client-config-dir
