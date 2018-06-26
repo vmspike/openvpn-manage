@@ -68,6 +68,11 @@ General instructions for various OSes:
     - Start OpenVPN GUI and connect, you'll see green icon in the tray on success and new tun/tap interface will be available;
     - Optionally ping VPN server to be sure it works properly: press `winkey+r` -> type `cmd` -> type `ping 172.31.240.1`
 
+    If you use configuration with `link-mtu` you additionally have to:
+    - Check tun-mtu value in openvpn client log on first connection attempt. The line looks like this: `Tue Jun 29 11:38:00 2018 WARNING: normally if you use --mssfix and/or --fragment, you should also set --tun-mtu 1500 (currently it is 1296)`
+    - Set the same value for MTU in TAP adapter settings (1296 in this example): `Control Panel` -> `Network and Internet` -> `Network Connnections` -> `Tap-Windows Adapter V9` -> `Properties` -> `Setup` -> `Additional settings` -> `MTU`
+    - Close openvpn connection and connect again, to apply MTU changes.
+
 - Linux
 
     - Add openvpn repository following the [instructions](https://community.openvpn.net/openvpn/wiki/OpenvpnSoftwareRepos) and install/upgrade openvpn;

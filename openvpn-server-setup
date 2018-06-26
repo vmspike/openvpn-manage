@@ -488,11 +488,11 @@ add_client() {
     case "${CLIENT_OS}" in
         windows)
             CLIENT_CONFIG_NAME="${USER}.ovpn"
-            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOF${BR}${WIN_SPECIFIC_OPTIONS}${BR}EOF"
+            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOFOSO${BR}# ${NIX_SPECIFIC_OPTIONS//${BR}/${BR}# }${BR}${BR}${WIN_SPECIFIC_OPTIONS}${BR}EOFOSO"
             ;;
         *)
             CLIENT_CONFIG_NAME="${USER}.conf"
-            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOF${BR}${NIX_SPECIFIC_OPTIONS}${BR}EOF"
+            eval "read -rd '' OS_SPECIFIC_OPTIONS <<EOFOSO${BR}${NIX_SPECIFIC_OPTIONS}${BR}${BR}# ${WIN_SPECIFIC_OPTIONS//${BR}/${BR}# }${BR}EOFOSO"
     esac
 
     cd "${EASYRSA}"
@@ -1559,7 +1559,7 @@ CLIENT_CONFIG_DIR='/etc/openvpn/chroot/ccd'
 # USERS_CONF="\${SERVER_DIR}/users-config"
 UDP_SERVER_CONF='/etc/openvpn/udp.server.conf'
 TCP_SERVER_CONF='/etc/openvpn/tcp.server.conf'
-SERVER_CONF=${UDP_SERVER_CONF}  # If tcp and udp servers subnet are the same, any config is fine here, othervise set the main one.
+SERVER_CONF=\${UDP_SERVER_CONF}  # If tcp and udp servers subnet are the same, any config is fine here, othervise set the main one.
 # EASYRSA='/etc/openvpn/easy-rsa/easyrsa3'
 CLIENT_OS_DEFAULT='windows'  # 'nix' for Unix-based OS, 'windows' for Windows
 # OPENVPN_USER=openvpn
