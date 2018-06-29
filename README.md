@@ -17,18 +17,30 @@ wget https://github.com/vmspike/openvpn-manage/raw/master/openvpn-server-setup
 
 # Review the content if you're paranoid and launch:
 sudo bash ./openvpn-server-setup
+# OR if you want to protect yourself from VPN tracking at the cost of performance, bandwidth, latency and stability
+sudo bash ./openvpn-server-setup --mssfix 0
+
 # If the script is unsure about some actions it will ask you interactively.
 # Review the script output to be sure that it completed successfully
+
 
 # After all apply customization if you need and create user(s)
 openvpn-manage create John_Smith
 ```
 
-`openvpn-server-setup` options `mssfix` (default) or `link-mtu` can be specified after all arguments to automatically set confguration type during setup:
-- `mssfix` generally more stable but less resistant to openvpn connection tracking by web sites;
-- `link-mtu` it's harder for web sites to understand that you use VPN, but it less stable and depends on various factors, manual tuning required to make it useful. Also in Windows clients it require to manually set fixed MTU for TAP adapter because automatic change does not supported by tap adapter on Windows hosts.
+`openvpn-server-setup` can be called with additional options: `[-i IFNAME] [--mssfix [VAL]] [--fragment [VAL]]`
 
-You can change this behavior after VPN server setup by modifying server and client configs (comment/uncomment corresponding lines).
+By default this script creates configurations with default `mssfix` and `fragment` options
+which is fine in most cases. BTW you can set the value you want by
+commandline option, particularly `mssfix 0` which can lead to high packets
+fragmentation which by-turn can lead to bandwidth and latency issues, but
+it's much more resistant to VPN-tracking by external web-sites and do not
+requre manual TAP adapter MTU fixing on Windows (which is required by `tun-mtu`
+or `link-mtu`).
+
+In all cases you can change this behavior after creation by modifying server and client configs.
+
+Network interface defaults to `eth0` if not specified by `-i`.
 
 After setup `openvpn-manage` tool will be available. Run it without arguments for help. Its content embedded to `openvpn-server-setup:OPENVPN_MANAGE` variable on top of the script.
 
