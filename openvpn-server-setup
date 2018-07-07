@@ -1283,6 +1283,13 @@ while [[ -n "$1" ]]; do
 done
 # declare -p mssfix fragment SERVER_LOCAL_IF; exit
 
+## Set time sync
+if hash timedatectl 2>/dev/null; then  # Systemd is in use
+    echo 'Enable time sync with NTP servers'
+    timedatectl set-ntp yes
+# else # TODO: add timesync for sysv init, probably by ntpd
+fi
+
 ## Check OS
 if [[ -f /etc/redhat-release ]]; then
     OS_family=RedHat
@@ -1941,6 +1948,10 @@ if hash sestatus 2>/dev/null && sestatus | grep -q 'SELinux status:\s\+enabled';
     echo 'SELinux enabled, creating the rule to allow openvpn server to run on non standard UDP port 443...'
     hash semanage 2>/dev/null || yum -y -d0 install policycoreutils-python
     semanage port -a -t openvpn_port_t -p udp 443
+    # TODO: sort out if the above does not work
+    # If does not work, this can help (but it's less secure):
+    #setenforce 0
+    # For permanent fix set /etc/selinux/config:SELINUX=permissive
 fi
 
 echo 'Stop/Start OpenVPN server'
