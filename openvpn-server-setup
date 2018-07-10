@@ -1285,9 +1285,9 @@ done
 
 ## Set time sync
 if hash timedatectl 2>/dev/null; then  # Systemd is in use
-    echo 'Enable time sync with NTP servers'
-    timedatectl set-ntp yes
-# else # TODO: add timesync for sysv init, probably by ntpd
+    echo 'Enable time sync with NTP servers using timedatectl'
+    timedatectl set-ntp yes  # TODO: handle the case when ntpd configured in the system, this have to be no in this case
+# else # Most probably sysv is in use, sync by ntpd will be configured later
 fi
 
 ## Check OS
@@ -1322,6 +1322,14 @@ if [[ -f /etc/redhat-release ]]; then
             systemctl start iptables
             ;;
         6)
+            ## Be sure that time is in sync (for OSes with systemd it's already done)
+            echo 'Setup time sync using ntpd'
+            yum -y -d0 install ntp
+            chkconfig ntpd on
+            ntpdate pool.ntp.org
+            service ntpd start
+            # ntpq -p
+
             echo 'Fix ancient ca-certs'
             yum --disablerepo=epel -y -d1 update ca-certificates
 
