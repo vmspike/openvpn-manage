@@ -36,7 +36,7 @@ fragment=';fragment 1450'
 read -rd '' OPENVPN_MANAGE <<'EOF_OPENVPN_MANAGE'
 #!/bin/bash
 
-SCRIPT_VERSION='0.7.1'
+SCRIPT_VERSION='0.7.3'
 
 read -rd '' HELP <<'EOF'
 Description:
@@ -1372,7 +1372,7 @@ case "${OS_family}" in
         echo 'Updating packages list'
         apt-get -yqq update
         echo 'Installing required packages'
-        apt-get -yq install openvpn zip unzip iptables iproute2 wget dnsutils openssl netfilter-persistent netcat-openbsd
+        apt-get -yq install openvpn zip unzip iptables iproute2 wget dnsutils openssl netfilter-persistent iptables-persistent netcat-openbsd
         ;;
 esac
 (($?==0)) || quit 1 'Failed to install required packages'
@@ -1655,12 +1655,11 @@ read -rd '' CLIENT_CONFIG_TEMPLATE <<'EOF'
 # When  connecting to a remote server do not wait for more than n seconds
 # waiting for a response before trying the next server. The default value is 120s.
 # This timeout includes proxy and TCP connect timeouts.
-server-poll-timeout 12
+server-poll-timeout 15
 
 ;remote-random
 ;local 192.168.1.\$((N%245+10))
 nobind
-server-poll-timeout 15
 
 ignore-unknown-option block-outside-dns dhcp-renew register-dns tap-sleep dhcp-release dhcp-option fragment
 
