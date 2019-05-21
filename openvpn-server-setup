@@ -36,7 +36,7 @@ fragment=';fragment 1450'
 read -rd '' OPENVPN_MANAGE <<'EOF_OPENVPN_MANAGE'
 #!/bin/bash
 
-SCRIPT_VERSION='0.7.3'
+SCRIPT_VERSION='0.7.4'
 
 read -rd '' HELP <<'EOF'
 Description:
@@ -1532,9 +1532,9 @@ chmod 750 bin/sh
 cp /etc/openvpn/easy-rsa/easyrsa3/vars{.example,}
 sed -i \
     -e 's|^#set_var\s\+EASYRSA_TEMP_FILE\s.*|set_var EASYRSA_TEMP_FILE "/dev/shm/extensions.temp"|' \
-    -e 's|^#set_var\s\+EASYRSA_CA_EXPIRE\s.*|set_var EASYRSA_CA_EXPIRE 7300|' \
-    -e 's|^#set_var\s\+EASYRSA_CERT_EXPIRE\s.*|set_var EASYRSA_CERT_EXPIRE 7300|' \
-    -e 's|^#set_var\s\+EASYRSA_CRL_DAYS\s.*|set_var EASYRSA_CRL_DAYS 7300|' \
+    -e 's|^#set_var\s\+EASYRSA_CA_EXPIRE\s.*|set_var EASYRSA_CA_EXPIRE 36500|' \
+    -e 's|^#set_var\s\+EASYRSA_CERT_EXPIRE\s.*|set_var EASYRSA_CERT_EXPIRE 36500|' \
+    -e 's|^#set_var\s\+EASYRSA_CRL_DAYS\s.*|set_var EASYRSA_CRL_DAYS 36500|' \
     -e 's|^#set_var\s\+EASYRSA_REQ_CN\s.*|set_var EASYRSA_REQ_CN "server"|' \
     -e 's|^#set_var\s\+EASYRSA_BATCH\s.*|set_var EASYRSA_BATCH "neveraskmehoney"|' \
     /etc/openvpn/easy-rsa/easyrsa3/vars
